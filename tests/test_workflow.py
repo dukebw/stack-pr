@@ -52,16 +52,32 @@ def test_range_inference_and_view_purity(
     repo: Repo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo.commit_file("feature.txt", "feature\n", "Feature subject\n\nFeature body\n")
+    (repo.path / "dirty.txt").write_text("leave me alone\n")
     before_head = repo.output("rev-parse", "HEAD")
     before_message = repo.output("show", "-s", "--format=%B", "HEAD")
+    before_status = repo.output("status", "--porcelain")
+    before_worktrees = repo.output("worktree", "list", "--porcelain")
     _mock_identity_and_preflight(monkeypatch)
+    reconcile_calls = 0
+    planned_branches: list[str] = []
 
     def fake_reconcile(
         path: object, manifest: Manifest, *, dry_run: bool
     ) -> ReconcileResult:
+        nonlocal reconcile_calls
         assert dry_run
         assert manifest.base == "master"
         assert manifest.remote == "origin"
+        reconcile_calls += 1
+        planned_branches[:] = [layer.branch for layer in manifest.layers]
+        if reconcile_calls == 2:
+            assert all(
+                repo.git(
+                    "show-ref", "--verify", f"refs/heads/{branch}", check=False
+                ).returncode
+                == 0
+                for branch in planned_branches
+            )
         return _result(manifest, ["create"])
 
     monkeypatch.setattr(workflow, "reconcile", fake_reconcile)
@@ -72,6 +88,65 @@ def test_range_inference_and_view_purity(
     assert repo.output("rev-parse", "HEAD") == before_head
     assert repo.output("show", "-s", "--format=%B", "HEAD") == before_message
     assert "stack-pr-branch:" not in before_message
+    assert repo.output("status", "--porcelain") == before_status
+    assert repo.output("worktree", "list", "--porcelain") == before_worktrees
+    assert reconcile_calls == 2
+    assert all(
+        repo.git("show-ref", "--verify", f"refs/heads/{branch}", check=False).returncode
+        != 0
+        for branch in planned_branches
+    )
+
+
+def test_view_detects_code_only_local_drift(
+    repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    branch = "octocat/stack/11111111111111111111111111111111"
+    old_head = repo.commit_file(
+        "feature.txt",
+        "old\n",
+        f"Feature subject\n\nFeature body\n\nstack-pr-branch: {branch}\n",
+    )
+    (repo.path / "feature.txt").write_text("new\n")
+    repo.git("add", "feature.txt")
+    repo.git("commit", "--amend", "--no-edit", "--no-gpg-sign")
+    local_head = repo.output("rev-parse", "HEAD")
+    assert local_head != old_head
+    _mock_identity_and_preflight(monkeypatch)
+    reconcile_calls = 0
+
+    def fake_reconcile(
+        path: object, manifest: Manifest, *, dry_run: bool
+    ) -> ReconcileResult:
+        nonlocal reconcile_calls
+        assert dry_run
+        reconcile_calls += 1
+        if reconcile_calls == 1:
+            assert (
+                repo.git(
+                    "show-ref", "--verify", f"refs/heads/{branch}", check=False
+                ).returncode
+                != 0
+            )
+            return _result(manifest, ["none"], head_shas={branch: old_head})
+
+        materialized_head = repo.output("rev-parse", branch)
+        assert materialized_head == local_head
+        return _result(manifest, ["update"], head_shas={branch: old_head})
+
+    monkeypatch.setattr(workflow, "reconcile", fake_reconcile)
+
+    result = workflow.view(repo.path, Options(None, "HEAD", None, "origin"))
+
+    assert result.reconcile_result is not None
+    assert result.reconcile_result.layers[0].status == "update"
+    assert reconcile_calls == 2
+    assert repo.output("rev-parse", "HEAD") == local_head
+    assert repo.output("status", "--porcelain") == ""
+    assert (
+        repo.git("show-ref", "--verify", f"refs/heads/{branch}", check=False).returncode
+        != 0
+    )
 
 
 def test_export_requires_clean_tree_before_native_preflight(

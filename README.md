@@ -39,11 +39,13 @@ stack-pr view
 stack-pr export
 ```
 
-`view` is read-only. `export` requires a clean working tree, fetches the remote,
-adds stable branch identities to commits that do not have one, replays active
-patches onto the latest target, and invokes the native reconciler. The source
-branch is never pushed. Human-readable exports report timed fetch, planning,
-and publishing stages on stderr; `--json` exports remain quiet.
+`view` does not change the source branch or GitHub. It fetches the remote and
+replays local layers in a disposable worktree so `synced` means their content,
+metadata, parent chain, and target all match the native stack. `export` requires
+a clean working tree, adds stable branch identities to commits that do not have
+one, replays active patches onto the latest target, and invokes the native
+reconciler. The source branch is never pushed. Human-readable commands report
+timed stages on stderr; `--json` remains quiet.
 
 Adding a branch identity rewrites that commit and its descendants. As with the
 original stack-pr metadata, this invalidates existing commit signatures.

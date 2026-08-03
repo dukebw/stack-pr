@@ -67,24 +67,57 @@ def _options(args: argparse.Namespace) -> Options:
     )
 
 
-def _render_plan(result: ReconcileResult, workflow: WorkflowResult) -> None:
+def _display_status(status: str, *, exported: bool) -> str:
+    if status == "none":
+        return "synced"
+    if not exported:
+        return status
+    return {
+        "create": "created",
+        "reopen": "reopened",
+        "remove": "removed",
+        "reorder": "reordered",
+        "update": "updated",
+    }.get(status, status)
+
+
+def _is_up_to_date(result: ReconcileResult) -> bool:
+    settled = {"merged", "none"}
+    return (
+        not result.blockers
+        and all(layer.status in settled for layer in result.layers)
+        and all(layer.status == "merged" for layer in result.removed_layers)
+    )
+
+
+def _render_plan(
+    result: ReconcileResult, workflow: WorkflowResult, *, exported: bool
+) -> None:
     titles = {layer.branch: layer.title for layer in workflow.manifest.layers}
-    print("Plan (top to bottom):")
+    print(f"{'Result' if exported else 'Plan'} (top to bottom):")
     for layer in reversed(result.layers):
         title = titles.get(layer.branch, layer.branch)
         pr = f" #{layer.number}" if layer.number is not None else ""
-        print(f"  {layer.status:<9}{pr} {title}")
+        status = _display_status(layer.status, exported=exported)
+        print(f"  {status:<9}{pr} {title}")
         if layer.url is not None:
             print(f"             {layer.url}")
         if layer.blocked_reason is not None:
             print(f"             {layer.blocked_reason}")
     for layer in reversed(result.removed_layers):
         pr = f" #{layer.number}" if layer.number is not None else ""
-        print(f"  {layer.status:<9}{pr} {layer.branch}")
+        status = _display_status(layer.status, exported=exported)
+        print(f"  {status:<9}{pr} {layer.branch}")
         if layer.url is not None:
             print(f"             {layer.url}")
     if result.stack_url is not None:
         print(f"Native stack: {result.stack_url}")
+    if exported or _is_up_to_date(result):
+        print("Stack is up to date with local commits.")
+    elif result.blockers:
+        print("Stack is not up to date; resolve the blockers before exporting.")
+    else:
+        print("Stack is not up to date; run `stack-pr export` to synchronize it.")
 
 
 def _print_result(result: WorkflowResult, *, json_output: bool, exported: bool) -> None:
@@ -115,7 +148,7 @@ def _print_result(result: WorkflowResult, *, json_output: bool, exported: bool) 
         print(json.dumps(reconcile_result.raw, sort_keys=True, separators=(",", ":")))
         return
 
-    _render_plan(reconcile_result, result)
+    _render_plan(reconcile_result, result, exported=exported)
     if (
         exported
         and reconcile_result.has_native_stack
@@ -129,11 +162,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         repo = repository_root(Path.cwd())
+        progress = None if args.json_output else _progress_step
         if args.command == "view":
-            result = view(repo, _options(args))
+            result = view(repo, _options(args), progress=progress)
             exported = False
         else:
-            progress = None if args.json_output else _progress_step
             result = export(repo, _options(args), progress=progress)
             exported = True
         _print_result(result, json_output=args.json_output, exported=exported)

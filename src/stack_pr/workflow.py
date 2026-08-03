@@ -13,6 +13,7 @@ from stack_pr.git import (
     check_source_upstream,
     current_branch,
     current_head,
+    detached_worktree,
     fetch_remote,
     infer_target,
     insert_missing_identities,
@@ -99,20 +100,53 @@ def _manifest(
     return Manifest(base=target, remote=remote, layers=tuple(layers))
 
 
-def view(repo: Path, options: Options) -> WorkflowResult:
-    target, _, commits = _resolve_range(repo, options, fetch=False)
+def view(
+    repo: Path, options: Options, *, progress: Progress | None = None
+) -> WorkflowResult:
+    step = progress or _quiet_progress
+    with step(f"Fetching {options.remote} and loading commits"):
+        target, _, commits = _resolve_range(repo, options, fetch=True)
     if not commits:
         return WorkflowResult(Manifest(target, options.remote, ()), None)
 
-    preflight(repo)
-    candidates = _assign_candidates(repo, commits)
-    manifest = _manifest(
-        target=target,
-        remote=options.remote,
-        commits=candidates,
-        draft=False,
-    )
-    return WorkflowResult(manifest, reconcile(repo, manifest, dry_run=True))
+    count = _layer_count(len(commits))
+    with step(f"Comparing {count} with {options.remote}/{target}"):
+        preflight(repo)
+        candidates = _assign_candidates(repo, commits)
+        manifest = _manifest(
+            target=target,
+            remote=options.remote,
+            commits=candidates,
+            draft=False,
+        )
+        preliminary = reconcile(repo, manifest, dry_run=True)
+        if preliminary.blockers:
+            return WorkflowResult(manifest, preliminary)
+        result_by_branch = {layer.branch: layer for layer in preliminary.layers}
+        for commit in candidates:
+            if commit.branch is None:
+                raise StackPrError(f"commit {commit.sha[:12]} has no branch identity")
+            result_layer = result_by_branch.get(commit.branch)
+            if result_layer is not None and result_layer.status == "merged":
+                require_merged_patch_unchanged(
+                    repo, commit, result_layer.head_sha, options.remote
+                )
+
+        with (
+            detached_worktree(
+                repo, f"{options.remote}/{target}"
+            ) as comparison_worktree,
+            materialize_layers(
+                comparison_worktree,
+                candidates,
+                merged_branches=preliminary.merged_branches,
+                remote=options.remote,
+                target=target,
+                source_branch=None,
+            ),
+        ):
+            compared = reconcile(repo, manifest, dry_run=True)
+    return WorkflowResult(manifest, compared)
 
 
 def export(

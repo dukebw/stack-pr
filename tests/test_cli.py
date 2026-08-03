@@ -7,7 +7,7 @@ import pytest
 
 from stack_pr import cli
 from stack_pr.cli import _print_result, create_argparser
-from stack_pr.reconcile import Manifest
+from stack_pr.reconcile import Manifest, ManifestLayer, parse_result
 from stack_pr.workflow import Options, Progress, WorkflowResult
 
 
@@ -90,3 +90,62 @@ def test_export_progress_uses_stderr_and_json_is_quiet(
     assert captured.err == ""
     assert progress_values[0] is not None
     assert progress_values[1] is None
+
+
+def workflow_result(action: str) -> WorkflowResult:
+    branch = "octocat/stack/11111111111111111111111111111111"
+    manifest = Manifest(
+        "master", "origin", (ManifestLayer(branch, "Exact subject", "Body", False),)
+    )
+    reconcile_result = parse_result(
+        {
+            "version": 1,
+            "layers": [
+                {
+                    "branch": branch,
+                    "status": "open",
+                    "action": action,
+                    "pr": {
+                        "number": 42,
+                        "url": "https://github.test/pull/42",
+                        "head_sha": "abc",
+                    },
+                }
+            ],
+            "removed_managed_layers": [],
+            "actions": [] if action == "none" else [{"type": action}],
+            "blockers": [],
+            "stack": {"url": "https://github.test/stacks/1"},
+        }
+    )
+    return WorkflowResult(manifest, reconcile_result)
+
+
+def test_view_renders_synced_stack_state(capsys: pytest.CaptureFixture[str]) -> None:
+    _print_result(workflow_result("none"), json_output=False, exported=False)
+
+    output = capsys.readouterr().out
+    assert "Plan (top to bottom):" in output
+    assert "synced    #42 Exact subject" in output
+    assert output.endswith("Stack is up to date with local commits.\n")
+
+
+def test_view_renders_pending_stack_state(capsys: pytest.CaptureFixture[str]) -> None:
+    _print_result(workflow_result("update"), json_output=False, exported=False)
+
+    output = capsys.readouterr().out
+    assert "update    #42 Exact subject" in output
+    assert output.endswith(
+        "Stack is not up to date; run `stack-pr export` to synchronize it.\n"
+    )
+
+
+def test_export_renders_applied_action_and_synced_state(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _print_result(workflow_result("update"), json_output=False, exported=True)
+
+    output = capsys.readouterr().out
+    assert "Result (top to bottom):" in output
+    assert "updated   #42 Exact subject" in output
+    assert "Stack is up to date with local commits." in output

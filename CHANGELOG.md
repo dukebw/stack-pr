@@ -1,5 +1,11 @@
 # Top of tree
 
+# Version 1.0.2
+
+* Show `synced` and an explicit stack-level up-to-date summary instead of the internal `none` action.
+* Compare replayed local layer SHAs from a disposable worktree so `view` detects code-only amendments and target movement.
+* Render completed export actions in the past tense and confirm the synchronized result.
+
 # Version 1.0.1
 
 * Show timed fetch, planning, and publishing progress during `stack-pr export`.

@@ -7,6 +7,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 
 class StackPrError(Exception):
@@ -527,7 +528,7 @@ def materialize_layers(
     merged_branches: set[str],
     remote: str,
     target: str,
-    source_branch: str,
+    source_branch: str | None,
 ) -> Iterator[None]:
     active = [commit for commit in commits if commit.branch not in merged_branches]
     for commit in active:
@@ -565,16 +566,30 @@ def materialize_layers(
             git(repo, "update-ref", f"refs/heads/{branch}", materialized_sha)
             created.append(branch)
 
-        git(repo, "checkout", source_branch)
-        detached = False
+        if source_branch is not None:
+            git(repo, "checkout", source_branch)
+            detached = False
         yield
     finally:
         git(repo, "cherry-pick", "--abort", check=False)
-        if detached or current_branch_if_attached(repo) != source_branch:
+        if source_branch is not None and (
+            detached or current_branch_if_attached(repo) != source_branch
+        ):
             git(repo, "reset", "--hard", check=False)
             git(repo, "checkout", source_branch, check=False)
         for branch in created:
             git(repo, "update-ref", "-d", f"refs/heads/{branch}", check=False)
+
+
+@contextmanager
+def detached_worktree(repo: Path, start_ref: str) -> Iterator[Path]:
+    with TemporaryDirectory(prefix="stack-pr-view-") as temporary_dir:
+        worktree = Path(temporary_dir) / "worktree"
+        git(repo, "worktree", "add", "--detach", str(worktree), start_ref)
+        try:
+            yield worktree
+        finally:
+            git(repo, "worktree", "remove", "--force", str(worktree), check=False)
 
 
 def current_branch_if_attached(repo: Path) -> str | None:
