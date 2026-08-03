@@ -1,5 +1,9 @@
 # Top of tree
 
+# Version 1.0.3
+
+* Include pending native Stack operations when deciding whether local commits are synchronized.
+
 # Version 1.0.2
 
 * Show `synced` and an explicit stack-level up-to-date summary instead of the internal `none` action.

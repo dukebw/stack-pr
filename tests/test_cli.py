@@ -140,6 +140,22 @@ def test_view_renders_pending_stack_state(capsys: pytest.CaptureFixture[str]) ->
     )
 
 
+def test_view_reports_pending_stack_level_action(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = workflow_result("none")
+    assert result.reconcile_result is not None
+    result.reconcile_result.raw["actions"] = [{"type": "create_stack"}]
+
+    _print_result(result, json_output=False, exported=False)
+
+    output = capsys.readouterr().out
+    assert "synced    #42 Exact subject" in output
+    assert output.endswith(
+        "Stack is not up to date; run `stack-pr export` to synchronize it.\n"
+    )
+
+
 def test_export_renders_applied_action_and_synced_state(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

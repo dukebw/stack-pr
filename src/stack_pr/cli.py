@@ -83,8 +83,14 @@ def _display_status(status: str, *, exported: bool) -> str:
 
 def _is_up_to_date(result: ReconcileResult) -> bool:
     settled = {"merged", "none"}
+    actions = result.raw.get("actions", [])
+    has_pending_action = not isinstance(actions, list) or any(
+        not isinstance(action, dict) or action.get("type") != "merged"
+        for action in actions
+    )
     return (
         not result.blockers
+        and not has_pending_action
         and all(layer.status in settled for layer in result.layers)
         and all(layer.status == "merged" for layer in result.removed_layers)
     )
