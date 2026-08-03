@@ -4,9 +4,9 @@ authors = [
     {name = "Modular Inc", email = "hello@modular.com"},
 ]
 maintainers = [
-    {name = "Modular Inc", email = "hello@modular.com"}
+    {name = "Brendan Duke"}
 ]
-description = "Stacked PR CLI for Github"
+description = "Commit-first CLI for native GitHub stacks"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
@@ -32,16 +32,16 @@ dependencies = ["typing_extensions; python_version<\"3.13\""]
 
 [project.optional-dependencies]
 dev = [
-    "pytest",
+    "pytest<9",
     "pytest-mock",
-    "mypy",
+    "mypy<2",
     "ruff",
 ]
 
 [project.urls]
-Homepage = "https://github.com/modular/stack-pr"
-Repository = "https://github.com/modular/stack-pr"
-"Bug Tracker" = "https://github.com/modular/stack-pr/issues"
+Homepage = "https://github.com/dukebw/stack-pr"
+Repository = "https://github.com/dukebw/stack-pr"
+"Bug Tracker" = "https://github.com/dukebw/stack-pr/issues"
 
 [project.scripts]
 stack-pr = "stack_pr.cli:main"
@@ -55,7 +55,7 @@ distribution = true
 
 [tool.pdm.version]
 source = "scm"
-fallback_version = "0.1.0"
+fallback_version = "1.0.0"
 
 [tool.pixi.project]
 channels = ["conda-forge"]
@@ -127,6 +127,7 @@ select = [
 ignore = [
     # This is just too complex to do anything about when invoking gh suprocess.
     "S603",  # subprocess call with untrusted input
+    "S607",  # Git and GitHub CLI are intentionally resolved from PATH
 
     # We use some of the strings for output in the CLI and want specific formatting.
     "TRY003", # Avoid specifying long messages outside exception class
@@ -178,8 +179,6 @@ multiline-quotes = "double"
 ]
 
 [tool.pytest.ini_options]
-asyncio_mode = "auto"
-asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v"

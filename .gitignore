@@ -83,7 +83,6 @@ venv.bak/
 *.egg-info
 pixi.lock
 
-.stack-pr.cfg
 .vscode
 
 .DS_Store

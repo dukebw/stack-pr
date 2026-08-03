@@ -5,7 +5,19 @@
 groups = ["default"]
 strategy = ["inherit_metadata"]
 lock_version = "4.5.0"
-content_hash = "sha256:7d846aa6a6cd8e19055f92109fc007b58ef4777ce68a30bedf80d1d2bbb07dd0"
+content_hash = "sha256:f5a19cf70adb0e69ec2c59adbd7dac57c0c8035ddefdf7a2f291c42ca692d5d1"
 
 [[metadata.targets]]
-requires_python = ">=3.8"
+requires_python = ">=3.9"
+
+[[package]]
+name = "typing-extensions"
+version = "4.16.0"
+requires_python = ">=3.9"
+summary = "Backported and Experimental Type Hints for Python 3.9+"
+groups = ["default"]
+marker = "python_version < \"3.13\""
+files = [
+    {file = "typing_extensions-4.16.0-py3-none-any.whl", hash = "sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8"},
+    {file = "typing_extensions-4.16.0.tar.gz", hash = "sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5"},
+]
