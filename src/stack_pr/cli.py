@@ -4,12 +4,27 @@ import argparse
 import json
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
+from time import monotonic
 
 from stack_pr.git import StackPrError, repository_root
 from stack_pr.reconcile import ReconcileResult
 from stack_pr.workflow import Options, WorkflowResult, export, view
+
+
+@contextmanager
+def _progress_step(message: str) -> Iterator[None]:
+    started_at = monotonic()
+    print(f"{message}...", end="", file=sys.stderr, flush=True)
+    completed = False
+    try:
+        yield
+        completed = True
+    finally:
+        status = "done" if completed else "failed"
+        print(f" {status} ({monotonic() - started_at:.1f}s)", file=sys.stderr)
 
 
 def create_argparser() -> argparse.ArgumentParser:
@@ -118,7 +133,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = view(repo, _options(args))
             exported = False
         else:
-            result = export(repo, _options(args))
+            progress = None if args.json_output else _progress_step
+            result = export(repo, _options(args), progress=progress)
             exported = True
         _print_result(result, json_output=args.json_output, exported=exported)
     except StackPrError as exc:

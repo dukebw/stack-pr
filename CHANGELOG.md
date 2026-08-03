@@ -1,5 +1,10 @@
 # Top of tree
 
+# Version 1.0.1
+
+* Show timed fetch, planning, and publishing progress during `stack-pr export`.
+* Keep `--json` exports quiet so stdout and stderr remain machine-friendly.
+
 # Version 1.0.0
 
 * Replaced custom remote stack management with native GitHub Stack reconciliation

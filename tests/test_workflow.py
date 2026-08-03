@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 import pytest
 
 from stack_pr import workflow
@@ -97,6 +100,13 @@ def test_export_replays_patch_onto_moved_target(
     repo.git("switch", "feature")
     _mock_identity_and_preflight(monkeypatch)
     applied_branch = ""
+    progress_events: list[str] = []
+
+    @contextmanager
+    def progress(message: str) -> Iterator[None]:
+        progress_events.append(f"start:{message}")
+        yield
+        progress_events.append(f"done:{message}")
 
     def fake_reconcile(
         path: object, manifest: Manifest, *, dry_run: bool
@@ -113,7 +123,7 @@ def test_export_replays_patch_onto_moved_target(
         return _result(manifest, ["create"])
 
     monkeypatch.setattr(workflow, "reconcile", fake_reconcile)
-    workflow.export(repo.path, Options(None, "HEAD", None, "origin"))
+    workflow.export(repo.path, Options(None, "HEAD", None, "origin"), progress=progress)
 
     assert repo.output("branch", "--show-current") == "feature"
     assert (
@@ -125,6 +135,14 @@ def test_export_replays_patch_onto_moved_target(
     assert "stack-pr-branch: octocat/stack/" in repo.output(
         "show", "-s", "--format=%B", "HEAD"
     )
+    assert progress_events == [
+        "start:Fetching origin and loading commits",
+        "done:Fetching origin and loading commits",
+        "start:Planning 1 layer against origin/master",
+        "done:Planning 1 layer against origin/master",
+        "start:Publishing 1 layer",
+        "done:Publishing 1 layer",
+    ]
 
 
 def test_export_skips_merged_layer_when_materializing(

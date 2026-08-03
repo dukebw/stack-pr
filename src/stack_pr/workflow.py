@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +31,17 @@ from stack_pr.reconcile import (
     preflight,
     reconcile,
 )
+
+Progress = Callable[[str], AbstractContextManager[None]]
+
+
+@contextmanager
+def _quiet_progress(_message: str) -> Iterator[None]:
+    yield
+
+
+def _layer_count(count: int) -> str:
+    return f"{count} {'layer' if count == 1 else 'layers'}"
 
 
 @dataclass(frozen=True)
@@ -102,53 +115,60 @@ def view(repo: Path, options: Options) -> WorkflowResult:
     return WorkflowResult(manifest, reconcile(repo, manifest, dry_run=True))
 
 
-def export(repo: Path, options: Options) -> WorkflowResult:
+def export(
+    repo: Path, options: Options, *, progress: Progress | None = None
+) -> WorkflowResult:
+    step = progress or _quiet_progress
     require_clean_worktree(repo)
     source_branch = current_branch(repo)
     source_tip = current_head(repo)
 
-    target, _, commits = _resolve_range(repo, options, fetch=True)
-    check_source_upstream(repo, source_branch, options.remote)
+    with step(f"Fetching {options.remote} and loading commits"):
+        target, _, commits = _resolve_range(repo, options, fetch=True)
+        check_source_upstream(repo, source_branch, options.remote)
     if not commits:
         return WorkflowResult(Manifest(target, options.remote, ()), None)
 
-    preflight(repo)
-    candidates = _assign_candidates(repo, commits)
-    manifest = _manifest(
-        target=target,
-        remote=options.remote,
-        commits=candidates,
-        draft=options.draft,
-    )
-    plan = reconcile(repo, manifest, dry_run=True)
-    if plan.blockers:
-        raise StackPrError(
-            "native reconciliation is blocked: " + "; ".join(plan.blockers)
+    count = _layer_count(len(commits))
+    with step(f"Planning {count} against {options.remote}/{target}"):
+        preflight(repo)
+        candidates = _assign_candidates(repo, commits)
+        manifest = _manifest(
+            target=target,
+            remote=options.remote,
+            commits=candidates,
+            draft=options.draft,
         )
-    result_by_branch = {layer.branch: layer for layer in plan.layers}
-    for commit in candidates:
-        if commit.branch is None:
-            raise StackPrError(f"commit {commit.sha[:12]} has no branch identity")
-        result_layer = result_by_branch.get(commit.branch)
-        if result_layer is not None and result_layer.status == "merged":
-            require_merged_patch_unchanged(
-                repo, commit, result_layer.head_sha, options.remote
+        plan = reconcile(repo, manifest, dry_run=True)
+        if plan.blockers:
+            raise StackPrError(
+                "native reconciliation is blocked: " + "; ".join(plan.blockers)
             )
+        result_by_branch = {layer.branch: layer for layer in plan.layers}
+        for commit in candidates:
+            if commit.branch is None:
+                raise StackPrError(f"commit {commit.sha[:12]} has no branch identity")
+            result_layer = result_by_branch.get(commit.branch)
+            if result_layer is not None and result_layer.status == "merged":
+                require_merged_patch_unchanged(
+                    repo, commit, result_layer.head_sha, options.remote
+                )
 
-    identified = insert_missing_identities(
-        repo,
-        commits,
-        candidates,
-        source_branch=source_branch,
-        source_tip=source_tip,
-    )
-    with materialize_layers(
-        repo,
-        identified,
-        merged_branches=plan.merged_branches,
-        remote=options.remote,
-        target=target,
-        source_branch=source_branch,
-    ):
-        applied = reconcile(repo, manifest, dry_run=False)
+    with step(f"Publishing {count}"):
+        identified = insert_missing_identities(
+            repo,
+            commits,
+            candidates,
+            source_branch=source_branch,
+            source_tip=source_tip,
+        )
+        with materialize_layers(
+            repo,
+            identified,
+            merged_branches=plan.merged_branches,
+            remote=options.remote,
+            target=target,
+            source_branch=source_branch,
+        ):
+            applied = reconcile(repo, manifest, dry_run=False)
     return WorkflowResult(manifest, applied)
