@@ -92,6 +92,33 @@ def test_export_progress_uses_stderr_and_json_is_quiet(
     assert progress_values[1] is None
 
 
+def test_color_is_semantic_and_can_be_forced(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("FORCE_COLOR", "1")
+
+    _print_result(workflow_result("update"), json_output=False, exported=False)
+
+    output = capsys.readouterr().out
+    assert "\033[1mPlan (top to bottom):\033[0m" in output
+    assert "\033[36;1mupdate   \033[0m" in output
+    assert "\033[35;1m#42\033[0m" in output
+    assert "\033[34;4mhttps://github.test/pull/42\033[0m" in output
+    assert "\033[33;1mStack is not up to date;\033[0m" in output
+    assert "\033[36;1m`stack-pr export`\033[0m" in output
+
+
+def test_no_color_overrides_forced_color(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.setenv("NO_COLOR", "")
+
+    _print_result(workflow_result("update"), json_output=False, exported=False)
+
+    assert "\033[" not in capsys.readouterr().out
+
+
 def workflow_result(action: str) -> WorkflowResult:
     branch = "octocat/stack/11111111111111111111111111111111"
     manifest = Manifest(
