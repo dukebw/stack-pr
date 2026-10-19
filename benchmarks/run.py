@@ -66,7 +66,7 @@ WORKLOADS: dict[str, Workload] = {
         name="view-clean",
         status="create",
         mutates=False,
-        required_calls=("git merge-tree", "git commit-tree", "git update-ref"),
+        required_calls=("git merge-tree", "git fast-import", "git update-ref"),
         # Replay is object-database only: no checkout, no worktree, no reset.
         forbidden_calls=("git worktree", "git cherry-pick", "git reset"),
         reconciles=2,
@@ -75,7 +75,7 @@ WORKLOADS: dict[str, Workload] = {
         name="export",
         status="create",
         mutates=True,
-        required_calls=("git merge-tree", "git commit-tree", "git update-ref"),
+        required_calls=("git merge-tree", "git fast-import", "git update-ref"),
         forbidden_calls=("git worktree", "git cherry-pick", "git reset"),
         reconciles=2,
     ),

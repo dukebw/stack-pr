@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
+from typing import IO, NoReturn
 
 
 class StackPrError(Exception):
@@ -18,6 +19,8 @@ MINIMUM_GIT_VERSION = (2, 40)
 GIT_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
 
 IDENTITY_KEY = "stack-pr-branch"
+# Scratch ref that `fast-import` writes commit chains to.
+REPLAY_REF = "refs/stack-pr/replay"
 # `cat-file --batch` header: "<sha> <type> <size>".
 BATCH_HEADER_FIELD_COUNT = 3
 METADATA_FIELD_COUNT = 9
@@ -376,45 +379,57 @@ def assign_missing_identities(
     return assigned
 
 
-def _commit_tree(
-    repo: Path,
-    source: Commit,
-    parent: str,
-    message: str,
-    *,
-    tree: str | None = None,
-) -> str:
-    env = os.environ.copy()
-    env.update(
-        {
-            "GIT_AUTHOR_NAME": source.author_name,
-            "GIT_AUTHOR_EMAIL": source.author_email,
-            "GIT_AUTHOR_DATE": source.author_date,
-            "GIT_COMMITTER_NAME": source.committer_name,
-            "GIT_COMMITTER_EMAIL": source.committer_email,
-            "GIT_COMMITTER_DATE": source.committer_date,
-        }
-    )
-    return git_output_with_input(
-        repo,
-        "commit-tree",
-        tree or source.tree,
-        "-p",
-        parent,
-        "-F",
-        "-",
-        input_text=message,
-        env=env,
-    )
+def _raw_date(iso_date: str) -> str:
+    """Convert a strict ISO 8601 date (`%aI`) to git's raw `<epoch> <+hhmm>`."""
+    moment = datetime.fromisoformat(iso_date)
+    offset = moment.utcoffset()
+    if offset is None:
+        raise StackPrError(f"commit date {iso_date!r} has no timezone")
+    minutes = int(offset.total_seconds()) // 60
+    sign = "-" if minutes < 0 else "+"
+    hours, minutes = divmod(abs(minutes), 60)
+    return f"{int(moment.timestamp())} {sign}{hours:02d}{minutes:02d}"
 
 
-def git_output_with_input(
-    repo: Path,
-    *args: str,
-    input_text: str,
-    env: Mapping[str, str] | None = None,
-) -> str:
-    return git(repo, *args, input_text=input_text, env=env).stdout.rstrip("\n")
+def _write_commit_chain(
+    repo: Path, parent: str, commits: Sequence[tuple[Commit, str, str]]
+) -> list[str]:
+    """Write `(source, message, tree)` commits as one parent chain, in one process.
+
+    Identities and dates come from each source commit, so a commit whose tree,
+    parent and message are unchanged gets its original SHA back. The chain is
+    written to REPLAY_REF, which callers delete when publishing the result.
+    """
+    stream = bytearray()
+    for index, (source, message, tree) in enumerate(commits, 1):
+        data = message.encode()
+        stream += (
+            f"commit {REPLAY_REF}\nmark :{index}\n"
+            f"author {source.author_name} <{source.author_email}> "
+            f"{_raw_date(source.author_date)}\n"
+            f"committer {source.committer_name} <{source.committer_email}> "
+            f"{_raw_date(source.committer_date)}\n"
+            f"data {len(data)}\n"
+        ).encode()
+        stream += data
+        previous = parent if index == 1 else f":{index - 1}"
+        stream += f'\nfrom {previous}\nM 040000 {tree} ""\n\n'.encode()
+    for index in range(1, len(commits) + 1):
+        stream += f"get-mark :{index}\n".encode()
+    stream += b"done\n"
+    result = subprocess.run(
+        ["git", "fast-import", "--quiet", "--done", "--force"],
+        cwd=repo,
+        input=bytes(stream),
+        capture_output=True,
+        check=False,
+    )
+    shas = result.stdout.decode().split()
+    if result.returncode != 0 or len(shas) != len(commits):
+        raise StackPrError(
+            f"git fast-import failed to write commits: {result.stderr.decode().strip()}"
+        )
+    return shas
 
 
 def _message_with_identity(message: str, branch: str) -> str:
@@ -458,8 +473,7 @@ def insert_missing_identities(
     first_missing = original_commits[first_missing_index]
     parent = first_missing.parents[0]
     commits_to_rewrite = load_linear_range(repo, parent, source_tip)
-    rewritten: dict[str, str] = {}
-
+    chain: list[tuple[Commit, str, str]] = []
     for commit in commits_to_rewrite:
         branch = assignments.get(commit.sha)
         message = (
@@ -467,17 +481,21 @@ def insert_missing_identities(
             if branch is not None
             else commit.message
         )
-        new_sha = _commit_tree(repo, commit, parent, message)
-        rewritten[commit.sha] = new_sha
-        parent = new_sha
+        chain.append((commit, message, commit.tree))
+    new_tip_shas = _write_commit_chain(repo, parent, chain)
+    rewritten = {
+        commit.sha: new_sha for commit, new_sha in zip(commits_to_rewrite, new_tip_shas)
+    }
 
     try:
         git(
             repo,
             "update-ref",
-            f"refs/heads/{source_branch}",
-            parent,
-            source_tip,
+            "--stdin",
+            input_text=(
+                f"update refs/heads/{source_branch} {new_tip_shas[-1]} {source_tip}\n"
+                f"delete {REPLAY_REF}\n"
+            ),
         )
     except subprocess.CalledProcessError as exc:
         raise StackPrError(
@@ -566,14 +584,77 @@ def require_merged_patch_unchanged(
         )
 
 
-def _replay_tree(repo: Path, commit: Commit, parent: str, target_label: str) -> str:
-    """Replay one commit's change onto `parent`, entirely in the object database.
+class _NulFields:
+    """Read NUL-terminated fields from a pipe as they arrive."""
+
+    def __init__(self, stream: IO[bytes]) -> None:
+        self._stream = stream
+        self._buffer = b""
+
+    def next(self) -> bytes | None:
+        while b"\0" not in self._buffer:
+            chunk = self._stream.read1(65536)  # type: ignore[attr-defined]
+            if not chunk:
+                return None
+            self._buffer += chunk
+        field, _, self._buffer = self._buffer.partition(b"\0")
+        return field
+
+
+def _replay_trees(
+    repo: Path, commits: Sequence[Commit], parent: str, target_label: str
+) -> list[str]:
+    """Replay each commit's change onto the previous result, in one process.
 
     `merge-tree --merge-base` runs the same three-way merge as `cherry-pick`
-    without reading or writing the index or working tree.
+    without reading or writing the index or working tree. With `--stdin` it
+    answers one merge per input line, so each layer can build on the last.
     """
-    if not commit.parents:
-        raise StackPrError(f"commit {commit.sha[:12]} has no parent to replay from")
+    process = subprocess.Popen(
+        ["git", "merge-tree", "--write-tree", "--stdin"],
+        cwd=repo,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if process.stdin is None or process.stdout is None:
+        raise StackPrError("git merge-tree did not open its pipes")
+    fields = _NulFields(process.stdout)
+    trees: list[str] = []
+    ours = parent
+    try:
+        for commit in commits:
+            if not commit.parents:
+                raise StackPrError(
+                    f"commit {commit.sha[:12]} has no parent to replay from"
+                )
+            process.stdin.write(
+                f"{commit.parents[0]} -- {ours} {commit.sha}\n".encode()
+            )
+            process.stdin.flush()
+            status, tree = fields.next(), fields.next()
+            if status == b"0":
+                _raise_replay_conflict(repo, commit, ours, target_label)
+            # A clean merge's record ends with an empty field.
+            if status != b"1" or tree is None or fields.next() != b"":
+                raise StackPrError(
+                    f"git merge-tree failed replaying commit {commit.sha[:12]}"
+                )
+            ours = tree.decode()
+            trees.append(ours)
+    finally:
+        process.stdin.close()
+        process.stdout.close()
+        stderr = process.stderr.read().decode() if process.stderr else ""
+        if process.wait() != 0 and len(trees) == len(commits):
+            raise StackPrError(f"git merge-tree failed: {stderr.strip()}")
+    return trees
+
+
+def _raise_replay_conflict(
+    repo: Path, commit: Commit, parent: str, target_label: str
+) -> NoReturn:
+    """Re-run one conflicted replay on its own to report its conflict details."""
     result = git(
         repo,
         "merge-tree",
@@ -584,16 +665,14 @@ def _replay_tree(repo: Path, commit: Commit, parent: str, target_label: str) -> 
         check=False,
     )
     lines = result.stdout.splitlines()
-    if result.returncode != 0 or not lines:
-        detail = (
-            "\n".join(line for line in lines[1:] if line.strip())
-            or result.stderr.strip()
-            or "patch did not apply"
-        )
-        raise StackPrError(
-            f"could not replay commit {commit.sha[:12]} onto {target_label}: {detail}"
-        )
-    return lines[0].strip()
+    detail = (
+        "\n".join(line for line in lines[1:] if line.strip())
+        or result.stderr.strip()
+        or "patch did not apply"
+    )
+    raise StackPrError(
+        f"could not replay commit {commit.sha[:12]} onto {target_label}: {detail}"
+    )
 
 
 def _local_branch_names(repo: Path) -> set[str]:
@@ -624,8 +703,8 @@ def materialize_layers(
 ) -> Iterator[None]:
     """Publish active layers as local branches replayed onto the target.
 
-    Every layer is built with `commit-tree` from a tree written by `merge-tree`,
-    so the caller's checkout, index and working tree are never touched.
+    Layer trees come from `merge-tree` and commits from `fast-import`, so the
+    caller's checkout, index and working tree are never touched.
     """
     active = [commit for commit in commits if commit.branch not in merged_branches]
     existing = _local_branch_names(repo)
@@ -641,15 +720,19 @@ def materialize_layers(
     parent = git_output(repo, "rev-parse", target_label)
     created: list[tuple[str, str | None]] = []
     try:
-        replayed: list[tuple[str, str]] = []
-        for commit in active:
-            if commit.branch is None:
-                raise StackPrError(f"commit {commit.sha[:12]} has no branch identity")
-            tree = _replay_tree(repo, commit, parent, target_label)
-            parent = _commit_tree(repo, commit, parent, commit.message, tree=tree)
-            replayed.append((f"refs/heads/{commit.branch}", parent))
-        _update_refs(repo, replayed)
-        created = [(ref, None) for ref, _value in replayed]
+        if active:
+            trees = _replay_trees(repo, active, parent, target_label)
+            shas = _write_commit_chain(
+                repo,
+                parent,
+                [(commit, commit.message, tree) for commit, tree in zip(active, trees)],
+            )
+            replayed = [
+                (f"refs/heads/{commit.branch}", sha)
+                for commit, sha in zip(active, shas)
+            ]
+            _update_refs(repo, [*replayed, (REPLAY_REF, None)])
+            created = [(ref, None) for ref, _value in replayed]
         yield
     finally:
         _update_refs(repo, created)

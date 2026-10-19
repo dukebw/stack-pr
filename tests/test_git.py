@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 
 import pytest
 
 from stack_pr.git import (
     StackPrError,
+    _write_commit_chain,
     assign_missing_identities,
     insert_missing_identities,
     load_linear_range,
@@ -127,3 +130,41 @@ def test_batched_read_preserves_raw_message_bytes(repo: Repo) -> None:
         repo.output("rev-parse", f"{sha}^{{tree}}") for sha in shas
     ]
     assert read_commit(repo.path, "HEAD").sha == repo.output("rev-parse", "HEAD")
+
+
+def test_commit_chain_reproduces_unchanged_commits(repo: Repo) -> None:
+    # Replayed layers keep their SHAs only if fast-import writes the same bytes
+    # `commit-tree` did, including half-hour offsets on either side of UTC.
+    shas: list[str] = []
+    parent = repo.root
+    dates = [
+        ("2024-03-01T12:34:56-03:30", "2024-03-02T01:02:03+05:45"),
+        ("2024-03-03T00:00:00+00:00", "2024-03-03T00:00:01-00:30"),
+    ]
+    messages = ["Verbatim ünïcode\n\nBody", "Trailing blanks\n\nBody\n\n\n"]
+    for (author_date, committer_date), message in zip(dates, messages):
+        tree = repo.output("rev-parse", f"{parent}^{{tree}}")
+        sha = subprocess.run(
+            ["git", "commit-tree", tree, "-p", parent, "-F", "-"],
+            cwd=repo.path,
+            input=message,
+            text=True,
+            capture_output=True,
+            check=True,
+            env={
+                **os.environ,
+                "GIT_AUTHOR_DATE": author_date,
+                "GIT_COMMITTER_DATE": committer_date,
+            },
+        ).stdout.strip()
+        shas.append(sha)
+        parent = sha
+    commits = read_commits(repo.path, shas)
+
+    rewritten = _write_commit_chain(
+        repo.path,
+        repo.root,
+        [(commit, commit.message, commit.tree) for commit in commits],
+    )
+
+    assert rewritten == shas
