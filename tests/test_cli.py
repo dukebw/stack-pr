@@ -183,6 +183,27 @@ def test_view_reports_pending_stack_level_action(
     )
 
 
+def test_view_lists_blockers_without_a_layer(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = workflow_result("blocked")
+    assert result.reconcile_result is not None
+    branch = result.manifest.layers[0].branch
+    result.reconcile_result.raw["blockers"] = [
+        {"code": "multiple_stacks", "message": "belongs to multiple stacks"},
+        {"code": "local_ref", "message": "layer reason", "branch": branch},
+    ]
+    result = WorkflowResult(result.manifest, parse_result(result.reconcile_result.raw))
+
+    _print_result(result, json_output=False, exported=False)
+
+    output = capsys.readouterr().out
+    assert output.count("layer reason") == 1
+    assert output.endswith(
+        "resolve the blockers before exporting:\n  belongs to multiple stacks\n"
+    )
+
+
 def test_export_renders_applied_action_and_synced_state(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

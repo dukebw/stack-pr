@@ -188,11 +188,17 @@ def _render_plan(
     elif result.blockers:
         print(
             _style(
-                "Stack is not up to date; resolve the blockers before exporting.",
+                "Stack is not up to date; resolve the blockers before exporting:",
                 _RED,
                 _BOLD,
             )
         )
+        # Reasons for desired layers are printed under them above; stack-level
+        # blockers and those of removed or foreign branches belong to none.
+        shown = {layer.blocked_reason for layer in result.layers}
+        for blocker in result.blockers:
+            if blocker not in shown:
+                print(f"  {_style(blocker, _RED)}")
     else:
         print(
             _style("Stack is not up to date;", _YELLOW, _BOLD),
