@@ -35,6 +35,7 @@ class Fixture:
     layers: int
     fillers: int
     feature_tip: str
+    trailers: bool
 
     @property
     def call_log(self) -> Path:
@@ -154,4 +155,6 @@ def build(
         check=True,
     ).stdout.strip()
 
-    return Fixture(root, repo, remote, bin_dir, state_dir, layers, fillers, tip)
+    return Fixture(
+        root, repo, remote, bin_dir, state_dir, layers, fillers, tip, trailers
+    )

@@ -35,8 +35,6 @@ from benchmarks.fixture import Fixture, build
 TRACER_DIR = Path(__file__).parent / "_tracer"
 SHIM = Path(__file__).parent / "gh_shim.py"
 BENCH_ROOT = Path(os.environ.get("SP_BENCH_ROOT", "/private/tmp/stack-pr-bench"))
-# The second reconcile is the one that must observe materialized layer branches.
-RECONCILES_BEFORE_MATERIALIZED = 2
 
 
 @dataclass(frozen=True)
@@ -47,6 +45,8 @@ class Workload:
     required_calls: tuple[str, ...]
     forbidden_calls: tuple[str, ...]
     reconciles: int
+    # Reconcile calls when no commit carries an identity yet.
+    unexported_reconciles: int
 
     @property
     def command(self) -> tuple[str, ...]:
@@ -61,6 +61,7 @@ WORKLOADS: dict[str, Workload] = {
         required_calls=(),
         forbidden_calls=(),
         reconciles=1,
+        unexported_reconciles=1,
     ),
     "view-clean": Workload(
         name="view-clean",
@@ -70,6 +71,8 @@ WORKLOADS: dict[str, Workload] = {
         # Replay is object-database only: no checkout, no worktree, no reset.
         forbidden_calls=("git worktree", "git cherry-pick", "git reset"),
         reconciles=2,
+        # A view of unexported commits skips the preliminary reconcile.
+        unexported_reconciles=1,
     ),
     "export": Workload(
         name="export",
@@ -78,6 +81,7 @@ WORKLOADS: dict[str, Workload] = {
         required_calls=("git merge-tree", "git fast-import", "git update-ref"),
         forbidden_calls=("git worktree", "git cherry-pick", "git reset"),
         reconciles=2,
+        unexported_reconciles=2,
     ),
 }
 
@@ -161,14 +165,15 @@ def _invoke(
     return Run(wall, result.returncode, result.stderr.strip(), trace, calls)
 
 
-def _check(workload: Workload, run: Run) -> None:
+def _check(workload: Workload, run: Run, *, trailers: bool) -> None:
     if run.returncode != 0:
         raise SystemExit(
             f"{workload.name}: stack-pr exited {run.returncode}\n{run.stderr}"
         )
-    if len(run.calls) != workload.reconciles:
+    expected = workload.reconciles if trailers else workload.unexported_reconciles
+    if len(run.calls) != expected:
         raise SystemExit(
-            f"{workload.name}: expected {workload.reconciles} reconcile calls, "
+            f"{workload.name}: expected {expected} reconcile calls, "
             f"saw {len(run.calls)} (cheap path taken?)"
         )
     seen = {" ".join(record["argv"]) for record in run.trace}
@@ -182,12 +187,10 @@ def _check(workload: Workload, run: Run) -> None:
 
 
 def _verify_materialized(fixture: Fixture, workload: Workload, delay_ms: int) -> bool:
-    """Prove reconcile #2 observed the materialized layer branches."""
+    """Prove the last reconcile observed the materialized layer branches."""
     run = _invoke(fixture, workload, delay_ms=delay_ms, verify=True)
-    _check(workload, run)
-    if len(run.calls) < RECONCILES_BEFORE_MATERIALIZED:
-        return False
-    present = run.calls[1].get("branches_present") or {}
+    _check(workload, run, trailers=fixture.trailers)
+    present = run.calls[-1].get("branches_present") or {}
     return bool(present) and all(present.values())
 
 
@@ -198,7 +201,7 @@ def _measure(
     for index in range(warmup + reps):
         fixture.restore()
         run = _invoke(fixture, workload, delay_ms=delay_ms, verify=False)
-        _check(workload, run)
+        _check(workload, run, trailers=fixture.trailers)
         if index >= warmup:
             runs.append(run)
 

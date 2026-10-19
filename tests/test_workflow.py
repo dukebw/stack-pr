@@ -70,14 +70,15 @@ def test_range_inference_and_view_purity(
         assert manifest.remote == "origin"
         reconcile_calls += 1
         planned_branches[:] = [layer.branch for layer in manifest.layers]
-        if reconcile_calls == 2:
-            assert all(
-                repo.git(
-                    "show-ref", "--verify", f"refs/heads/{branch}", check=False
-                ).returncode
-                == 0
-                for branch in planned_branches
-            )
+        # Unexported commits have no PRs to look up first, so the only
+        # reconcile compares the materialized layers.
+        assert all(
+            repo.git(
+                "show-ref", "--verify", f"refs/heads/{branch}", check=False
+            ).returncode
+            == 0
+            for branch in planned_branches
+        )
         return _result(manifest, ["create"])
 
     monkeypatch.setattr(workflow, "reconcile", fake_reconcile)
@@ -90,7 +91,7 @@ def test_range_inference_and_view_purity(
     assert "stack-pr-branch:" not in before_message
     assert repo.output("status", "--porcelain") == before_status
     assert repo.output("worktree", "list", "--porcelain") == before_worktrees
-    assert reconcile_calls == 2
+    assert reconcile_calls == 1
     assert all(
         repo.git("show-ref", "--verify", f"refs/heads/{branch}", check=False).returncode
         != 0

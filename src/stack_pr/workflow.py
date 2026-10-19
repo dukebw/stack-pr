@@ -126,23 +126,30 @@ def view(
             commits=candidates,
             draft=False,
         )
-        preliminary = reconcile(repo, manifest, dry_run=True)
-        if preliminary.blockers:
-            return WorkflowResult(manifest, preliminary)
-        result_by_branch = {layer.branch: layer for layer in preliminary.layers}
-        for commit in candidates:
-            if commit.branch is None:
-                raise StackPrError(f"commit {commit.sha[:12]} has no branch identity")
-            result_layer = result_by_branch.get(commit.branch)
-            if result_layer is not None and result_layer.status == "merged":
-                require_merged_patch_unchanged(
-                    repo, commit, result_layer.head_sha, options.remote
-                )
+        merged_branches: set[str] = set()
+        # Commits without an identity were never exported, so none has a PR
+        # that could be merged, and the comparison reports any blocker itself.
+        if any(commit.branch is not None for commit in commits):
+            preliminary = reconcile(repo, manifest, dry_run=True)
+            if preliminary.blockers:
+                return WorkflowResult(manifest, preliminary)
+            result_by_branch = {layer.branch: layer for layer in preliminary.layers}
+            for commit in candidates:
+                if commit.branch is None:
+                    raise StackPrError(
+                        f"commit {commit.sha[:12]} has no branch identity"
+                    )
+                result_layer = result_by_branch.get(commit.branch)
+                if result_layer is not None and result_layer.status == "merged":
+                    require_merged_patch_unchanged(
+                        repo, commit, result_layer.head_sha, options.remote
+                    )
+            merged_branches = preliminary.merged_branches
 
         with materialize_layers(
             repo,
             candidates,
-            merged_branches=preliminary.merged_branches,
+            merged_branches=merged_branches,
             remote=options.remote,
             target=target,
         ):
