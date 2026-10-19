@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 
@@ -222,10 +224,10 @@ def test_export_replays_patch_onto_moved_target(
         "show", "-s", "--format=%B", "HEAD"
     )
     assert progress_events == [
-        "start:Fetching origin and loading commits",
-        "done:Fetching origin and loading commits",
-        "start:Planning 1 layer against origin/master",
-        "done:Planning 1 layer against origin/master",
+        "start:Fetching origin and planning",
+        "done:Fetching origin and planning",
+        "start:Checking 1 layer against origin/master",
+        "done:Checking 1 layer against origin/master",
         "start:Publishing 1 layer",
         "done:Publishing 1 layer",
     ]
@@ -330,6 +332,42 @@ def test_replay_conflict_restores_checkout_and_temporary_state(
         != 0
         for branch in planned_branches
     )
+
+
+def test_export_replans_when_fetch_moves_the_range(
+    repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo.commit_file("one.txt", "one\n", "One\n")
+    repo.commit_file("two.txt", "two\n", "Two\n")
+    # The remote target fast-forwards to the bottom layer, but the local
+    # tracking ref only learns that from the fetch.
+    stale_target = repo.output("rev-parse", "origin/master")
+    repo.git("push", "origin", "HEAD~1:refs/heads/master")
+    repo.git("update-ref", "refs/remotes/origin/master", stale_target)
+    _mock_identity_and_preflight(monkeypatch)
+    planned: list[list[str]] = []
+    first_plan = threading.Event()
+    fetch_remote = workflow.fetch_remote
+
+    def fetch_after_first_plan(path: Path, remote: str) -> None:
+        assert first_plan.wait(timeout=30)
+        fetch_remote(path, remote)
+
+    def fake_reconcile(
+        path: object, manifest: Manifest, *, dry_run: bool
+    ) -> ReconcileResult:
+        if dry_run:
+            planned.append([layer.title for layer in manifest.layers])
+            first_plan.set()
+        return _result(manifest, ["create"] * len(manifest.layers))
+
+    monkeypatch.setattr(workflow, "fetch_remote", fetch_after_first_plan)
+    monkeypatch.setattr(workflow, "reconcile", fake_reconcile)
+
+    result = workflow.export(repo.path, Options(None, "HEAD", None, "origin"))
+
+    assert planned == [["One", "Two"], ["Two"]]
+    assert [layer.title for layer in result.manifest.layers] == ["Two"]
 
 
 def test_empty_range_is_noop_without_reconcile(

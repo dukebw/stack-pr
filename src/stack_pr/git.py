@@ -183,7 +183,8 @@ def infer_target(repo: Path, remote: str) -> str:
     )
 
 
-def require_remote_target(repo: Path, remote: str, target: str) -> None:
+def require_remote_target(repo: Path, remote: str, target: str) -> str:
+    """Return the SHA of the remote target's tracking ref, which must exist."""
     result = git(
         repo,
         "rev-parse",
@@ -194,6 +195,7 @@ def require_remote_target(repo: Path, remote: str, target: str) -> None:
     )
     if result.returncode != 0:
         raise StackPrError(f"remote target {remote}/{target} does not exist locally")
+    return result.stdout.strip()
 
 
 def merge_base(repo: Path, head: str, remote: str, target: str) -> str:

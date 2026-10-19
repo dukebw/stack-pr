@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from stack_pr.git import (
@@ -78,15 +79,128 @@ def _assign_candidates(
     )
 
 
-def _resolve_range(
-    repo: Path, options: Options, *, fetch: bool
-) -> tuple[str, str, list[Commit]]:
+@dataclass(frozen=True)
+class _Range:
+    target: str
+    target_sha: str
+    base: str
+    commits: list[Commit]
+
+
+def _resolve_range(repo: Path, options: Options) -> _Range:
     target = options.target or infer_target(repo, options.remote)
-    if fetch:
-        fetch_remote(repo, options.remote)
-    require_remote_target(repo, options.remote, target)
+    target_sha = require_remote_target(repo, options.remote, target)
     base = options.base or merge_base(repo, options.head, options.remote, target)
-    return target, base, load_linear_range(repo, base, options.head)
+    return _Range(target, target_sha, base, load_linear_range(repo, base, options.head))
+
+
+def _refetched_range(repo: Path, options: Options, stale: _Range) -> _Range:
+    """Resolve the range again after a fetch, reusing `stale` where it holds.
+
+    The range is base..head and head does not move during a fetch, so it can
+    change only if the fetched target moved its merge base.
+    """
+    target = options.target or infer_target(repo, options.remote)
+    if target == stale.target:
+        target_sha = require_remote_target(repo, options.remote, target)
+        if target_sha == stale.target_sha:
+            return stale
+        base = options.base or merge_base(repo, options.head, options.remote, target)
+        if base == stale.base:
+            return replace(stale, target_sha=target_sha)
+    return _resolve_range(repo, options)
+
+
+@dataclass(frozen=True)
+class _Plan:
+    target: str
+    commits: list[Commit]
+    candidates: list[Commit]
+    manifest: Manifest
+    preliminary: ReconcileResult | None
+
+
+def _plan(
+    repo: Path,
+    options: Options,
+    commit_range: _Range,
+    *,
+    login: str | None,
+    draft: bool,
+    preliminary: bool,
+) -> _Plan:
+    commits = commit_range.commits
+    candidates = _assign_candidates(repo, commits, login=login) if commits else []
+    manifest = _manifest(
+        target=commit_range.target,
+        remote=options.remote,
+        commits=candidates,
+        draft=draft,
+    )
+    result = (
+        reconcile(repo, manifest, dry_run=True) if preliminary and commits else None
+    )
+    return _Plan(commit_range.target, commits, candidates, manifest, result)
+
+
+def _fetch_and_plan(
+    repo: Path,
+    options: Options,
+    *,
+    login: str | None,
+    draft: bool,
+    preliminary: Callable[[list[Commit]], bool],
+) -> _Plan:
+    """Fetch the remote while planning against the target fetched last time.
+
+    Fetching changes the commit range only when the remote target gained
+    commits from it, so the plan usually stands; it is redone when the range
+    differs, or when the stale target could not be used.
+    """
+    stale: _Range | None = None
+    speculative: _Plan | None = None
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        fetching = pool.submit(fetch_remote, repo, options.remote)
+        try:
+            stale = _resolve_range(repo, options)
+            if stale.commits:
+                preflight(repo)
+                speculative = _plan(
+                    repo,
+                    options,
+                    stale,
+                    login=login,
+                    draft=draft,
+                    preliminary=preliminary(stale.commits),
+                )
+        except StackPrError:
+            # Redone below, so fetch and preflight errors take precedence.
+            stale = speculative = None
+        fetching.result()
+    if stale is None:
+        fresh = _resolve_range(repo, options)
+    else:
+        fresh = _refetched_range(repo, options, stale)
+    if (
+        speculative is not None
+        and speculative.target == fresh.target
+        and [c.sha for c in speculative.commits] == [c.sha for c in fresh.commits]
+    ):
+        return speculative
+    if fresh.commits and speculative is None:
+        preflight(repo)
+    return _plan(
+        repo,
+        options,
+        fresh,
+        login=login,
+        draft=draft,
+        preliminary=preliminary(fresh.commits),
+    )
+
+
+def _has_identity(commits: list[Commit]) -> bool:
+    return any(commit.branch is not None for commit in commits)
 
 
 def _manifest(
@@ -112,25 +226,25 @@ def view(
 ) -> WorkflowResult:
     step = progress or _quiet_progress
     with step(f"Fetching {options.remote} and loading commits"):
-        target, _, commits = _resolve_range(repo, options, fetch=True)
+        # Commits without an identity were never exported, so none has a PR
+        # that could be merged, and the comparison reports any blocker itself.
+        planned = _fetch_and_plan(
+            repo, options, login=VIEW_LOGIN, draft=False, preliminary=_has_identity
+        )
+    target, commits, candidates, manifest = (
+        planned.target,
+        planned.commits,
+        planned.candidates,
+        planned.manifest,
+    )
     if not commits:
-        return WorkflowResult(Manifest(target, options.remote, ()), None)
+        return WorkflowResult(manifest, None)
 
     count = _layer_count(len(commits))
     with step(f"Comparing {count} with {options.remote}/{target}"):
-        preflight(repo)
-        candidates = _assign_candidates(repo, commits, login=VIEW_LOGIN)
-        manifest = _manifest(
-            target=target,
-            remote=options.remote,
-            commits=candidates,
-            draft=False,
-        )
         merged_branches: set[str] = set()
-        # Commits without an identity were never exported, so none has a PR
-        # that could be merged, and the comparison reports any blocker itself.
-        if any(commit.branch is not None for commit in commits):
-            preliminary = reconcile(repo, manifest, dry_run=True)
+        preliminary = planned.preliminary
+        if preliminary is not None:
             if preliminary.blockers:
                 return WorkflowResult(manifest, preliminary)
             result_by_branch = {layer.branch: layer for layer in preliminary.layers}
@@ -165,23 +279,29 @@ def export(
     source_branch = current_branch(repo)
     source_tip = current_head(repo)
 
-    with step(f"Fetching {options.remote} and loading commits"):
-        target, _, commits = _resolve_range(repo, options, fetch=True)
+    with step(f"Fetching {options.remote} and planning"):
+        planned = _fetch_and_plan(
+            repo,
+            options,
+            login=None,
+            draft=options.draft,
+            preliminary=lambda _commits: True,
+        )
         check_source_upstream(repo, source_branch, options.remote)
+    target, commits, candidates, manifest = (
+        planned.target,
+        planned.commits,
+        planned.candidates,
+        planned.manifest,
+    )
     if not commits:
-        return WorkflowResult(Manifest(target, options.remote, ()), None)
+        return WorkflowResult(manifest, None)
 
     count = _layer_count(len(commits))
-    with step(f"Planning {count} against {options.remote}/{target}"):
-        preflight(repo)
-        candidates = _assign_candidates(repo, commits)
-        manifest = _manifest(
-            target=target,
-            remote=options.remote,
-            commits=candidates,
-            draft=options.draft,
-        )
-        plan = reconcile(repo, manifest, dry_run=True)
+    with step(f"Checking {count} against {options.remote}/{target}"):
+        plan = planned.preliminary
+        if plan is None:
+            raise StackPrError("export planned no reconciliation")
         if plan.blockers:
             raise StackPrError(
                 "native reconciliation is blocked: " + "; ".join(plan.blockers)
