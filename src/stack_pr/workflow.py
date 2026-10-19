@@ -63,10 +63,18 @@ class WorkflowResult:
         return not self.manifest.layers
 
 
-def _assign_candidates(repo: Path, commits: list[Commit]) -> list[Commit]:
-    login = github_login(repo)
+# A view's identities for unexported commits are random and never published,
+# so they cannot match a PR whatever login prefixes them.
+VIEW_LOGIN = "stack-pr"
+
+
+def _assign_candidates(
+    repo: Path, commits: list[Commit], *, login: str | None = None
+) -> list[Commit]:
+    if all(commit.branch is not None for commit in commits):
+        return commits
     return assign_missing_identities(
-        commits, login, (uuid.uuid4().hex for _ in commits)
+        commits, login or github_login(repo), (uuid.uuid4().hex for _ in commits)
     )
 
 
@@ -111,7 +119,7 @@ def view(
     count = _layer_count(len(commits))
     with step(f"Comparing {count} with {options.remote}/{target}"):
         preflight(repo)
-        candidates = _assign_candidates(repo, commits)
+        candidates = _assign_candidates(repo, commits, login=VIEW_LOGIN)
         manifest = _manifest(
             target=target,
             remote=options.remote,
