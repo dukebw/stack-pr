@@ -350,18 +350,21 @@ def read_commit(repo: Path, sha: str) -> Commit:
 
 
 def load_linear_range(repo: Path, base: str, head: str) -> list[Commit]:
-    base_sha = git_output(repo, "rev-parse", base)
-    head_sha = git_output(repo, "rev-parse", head)
-    if not is_ancestor(repo, base_sha, head_sha):
-        raise StackPrError(f"range base {base!r} is not an ancestor of {head!r}")
-
+    base_sha, head_sha = git_output(repo, "rev-parse", base, head).splitlines()
     shas = git_output(
         repo, "rev-list", "--reverse", "--topo-order", f"{base_sha}..{head_sha}"
     ).splitlines()
+    # A non-empty range passes the parent-chain check below only if base is an
+    # ancestor of head, so the explicit check runs only when that cannot tell.
+    not_ancestor = StackPrError(f"range base {base!r} is not an ancestor of {head!r}")
+    if not shas and not is_ancestor(repo, base_sha, head_sha):
+        raise not_ancestor
     commits = read_commits(repo, shas)
     expected_parent = base_sha
     for commit in commits:
         if commit.parents != (expected_parent,):
+            if not is_ancestor(repo, base_sha, head_sha):
+                raise not_ancestor
             raise StackPrError(
                 "selected history must be linear and contain no merge commits; "
                 f"commit {commit.sha[:12]} has {len(commit.parents)} parents"

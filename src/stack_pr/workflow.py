@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -161,12 +161,13 @@ def _fetch_and_plan(
     """
     stale: _Range | None = None
     speculative: _Plan | None = None
-    with ThreadPoolExecutor(max_workers=1) as pool:
+    checking: Future[None] | None = None
+    with ThreadPoolExecutor(max_workers=2) as pool:
         fetching = pool.submit(fetch_remote, repo, options.remote, refspecs)
         try:
             stale = _resolve_range(repo, options, target)
             if stale.commits:
-                preflight(repo)
+                checking = pool.submit(preflight, repo)
                 speculative = _plan(
                     repo,
                     options,
@@ -179,6 +180,8 @@ def _fetch_and_plan(
             # Redone below, so fetch and preflight errors take precedence.
             stale = speculative = None
         fetching.result()
+        if checking is not None:
+            checking.result()
     if stale is None:
         fresh = _resolve_range(repo, options, target)
     else:
@@ -187,7 +190,7 @@ def _fetch_and_plan(
         c.sha for c in fresh.commits
     ]:
         return speculative
-    if fresh.commits and speculative is None:
+    if fresh.commits and checking is None:
         preflight(repo)
     return _plan(
         repo,
