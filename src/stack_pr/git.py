@@ -149,12 +149,34 @@ def require_clean_worktree(repo: Path) -> None:
         raise StackPrError("export requires a clean working tree")
 
 
-def fetch_remote(repo: Path, remote: str) -> None:
+def fetch_remote(repo: Path, remote: str, refspecs: Sequence[str] = ()) -> None:
+    """Fetch `refspecs` from `remote`, or everything (pruning) when none given."""
+    args = refspecs or ("--prune",)
     try:
-        git(repo, "fetch", "--prune", remote)
+        git(repo, "fetch", remote, *args)
     except subprocess.CalledProcessError as exc:
         detail = exc.stderr.strip() or str(exc)
         raise StackPrError(f"failed to fetch remote {remote!r}: {detail}") from exc
+
+
+def tracking_refspec(remote: str, branch: str) -> str:
+    return f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"
+
+
+def upstream_refspec(repo: Path, branch: str, remote: str) -> str | None:
+    """Refspec refreshing `branch`'s upstream, if that is a branch of `remote`."""
+    listed = git_output(
+        repo,
+        "for-each-ref",
+        "--format=%(refname)%00%(upstream:remotename)%00%(upstream:remoteref)"
+        "%00%(upstream)",
+        f"refs/heads/{branch}",
+    )
+    for line in listed.splitlines():
+        refname, upstream_remote, remote_ref, tracking = line.split("\0")
+        if refname == f"refs/heads/{branch}" and upstream_remote == remote:
+            return f"+{remote_ref}:{tracking}" if remote_ref and tracking else None
+    return None
 
 
 def infer_target(repo: Path, remote: str) -> str:

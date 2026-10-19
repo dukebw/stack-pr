@@ -340,9 +340,9 @@ def test_export_replans_when_fetch_moves_the_range(
     first_plan = threading.Event()
     fetch_remote = workflow.fetch_remote
 
-    def fetch_after_first_plan(path: Path, remote: str) -> None:
+    def fetch_after_first_plan(path: Path, remote: str, refspecs: list[str]) -> None:
         assert first_plan.wait(timeout=30)
-        fetch_remote(path, remote)
+        fetch_remote(path, remote, refspecs)
 
     def fake_reconcile(
         path: object, manifest: Manifest, *, dry_run: bool
@@ -406,6 +406,8 @@ def test_export_rejects_changes_only_on_source_upstream(repo: Repo) -> None:
     repo.commit_file("remote.txt", "remote\n", "Remote change\n")
     repo.git("push", "origin", "feature")
     repo.git("reset", "--hard", "HEAD~1")
+    # Only export's own fetch of the upstream can reveal the remote change.
+    repo.git("update-ref", "refs/remotes/origin/feature", "HEAD")
 
     with pytest.raises(StackPrError, match="missing changes from its upstream"):
         workflow.export(repo.path, Options(repo.root, "HEAD", "master", "origin"))

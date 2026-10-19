@@ -23,6 +23,8 @@ from stack_pr.git import (
     require_clean_worktree,
     require_merged_patch_unchanged,
     require_remote_target,
+    tracking_refspec,
+    upstream_refspec,
 )
 from stack_pr.reconcile import (
     Manifest,
@@ -87,8 +89,7 @@ class _Range:
     commits: list[Commit]
 
 
-def _resolve_range(repo: Path, options: Options) -> _Range:
-    target = options.target or infer_target(repo, options.remote)
+def _resolve_range(repo: Path, options: Options, target: str) -> _Range:
     target_sha = require_remote_target(repo, options.remote, target)
     base = options.base or merge_base(repo, options.head, options.remote, target)
     return _Range(target, target_sha, base, load_linear_range(repo, base, options.head))
@@ -100,15 +101,13 @@ def _refetched_range(repo: Path, options: Options, stale: _Range) -> _Range:
     The range is base..head and head does not move during a fetch, so it can
     change only if the fetched target moved its merge base.
     """
-    target = options.target or infer_target(repo, options.remote)
-    if target == stale.target:
-        target_sha = require_remote_target(repo, options.remote, target)
-        if target_sha == stale.target_sha:
-            return stale
-        base = options.base or merge_base(repo, options.head, options.remote, target)
-        if base == stale.base:
-            return replace(stale, target_sha=target_sha)
-    return _resolve_range(repo, options)
+    target_sha = require_remote_target(repo, options.remote, stale.target)
+    if target_sha == stale.target_sha:
+        return stale
+    base = options.base or merge_base(repo, options.head, options.remote, stale.target)
+    if base == stale.base:
+        return replace(stale, target_sha=target_sha)
+    return _resolve_range(repo, options, stale.target)
 
 
 @dataclass(frozen=True)
@@ -147,6 +146,8 @@ def _fetch_and_plan(
     repo: Path,
     options: Options,
     *,
+    target: str,
+    refspecs: list[str],
     login: str | None,
     draft: bool,
     preliminary: Callable[[list[Commit]], bool],
@@ -155,14 +156,15 @@ def _fetch_and_plan(
 
     Fetching changes the commit range only when the remote target gained
     commits from it, so the plan usually stands; it is redone when the range
-    differs, or when the stale target could not be used.
+    differs, or when the stale target could not be used. Only `refspecs` are
+    fetched: a full fetch of a repository with many branches costs seconds.
     """
     stale: _Range | None = None
     speculative: _Plan | None = None
     with ThreadPoolExecutor(max_workers=1) as pool:
-        fetching = pool.submit(fetch_remote, repo, options.remote)
+        fetching = pool.submit(fetch_remote, repo, options.remote, refspecs)
         try:
-            stale = _resolve_range(repo, options)
+            stale = _resolve_range(repo, options, target)
             if stale.commits:
                 preflight(repo)
                 speculative = _plan(
@@ -178,14 +180,12 @@ def _fetch_and_plan(
             stale = speculative = None
         fetching.result()
     if stale is None:
-        fresh = _resolve_range(repo, options)
+        fresh = _resolve_range(repo, options, target)
     else:
         fresh = _refetched_range(repo, options, stale)
-    if (
-        speculative is not None
-        and speculative.target == fresh.target
-        and [c.sha for c in speculative.commits] == [c.sha for c in fresh.commits]
-    ):
+    if speculative is not None and [c.sha for c in speculative.commits] == [
+        c.sha for c in fresh.commits
+    ]:
         return speculative
     if fresh.commits and speculative is None:
         preflight(repo)
@@ -226,15 +226,17 @@ def view(
 ) -> WorkflowResult:
     step = progress or _quiet_progress
     with step(f"Fetching {options.remote} and loading commits"):
+        target = options.target or infer_target(repo, options.remote)
         planned = _fetch_and_plan(
             repo,
             options,
+            target=target,
+            refspecs=[tracking_refspec(options.remote, target)],
             login=VIEW_LOGIN,
             draft=False,
             preliminary=lambda _commits: True,
         )
-    target, commits, candidates, manifest = (
-        planned.target,
+    commits, candidates, manifest = (
         planned.commits,
         planned.candidates,
         planned.manifest,
@@ -282,16 +284,22 @@ def export(
     source_tip = current_head(repo)
 
     with step(f"Fetching {options.remote} and planning"):
+        target = options.target or infer_target(repo, options.remote)
+        refspecs = [tracking_refspec(options.remote, target)]
+        upstream = upstream_refspec(repo, source_branch, options.remote)
+        if upstream is not None:
+            refspecs.append(upstream)
         planned = _fetch_and_plan(
             repo,
             options,
+            target=target,
+            refspecs=refspecs,
             login=None,
             draft=options.draft,
             preliminary=lambda _commits: True,
         )
         check_source_upstream(repo, source_branch, options.remote)
-    target, commits, candidates, manifest = (
-        planned.target,
+    commits, candidates, manifest = (
         planned.commits,
         planned.candidates,
         planned.manifest,
