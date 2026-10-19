@@ -168,6 +168,12 @@ inline-quotes = "double"
 multiline-quotes = "double"
 
 [tool.ruff.lint.extend-per-file-ignores]
+# The tracer must mirror subprocess.run's untyped signature and holds its trace
+# handle open for the life of the process.
+"benchmarks/_tracer/sitecustomize.py" = [
+  "ANN401", # allow Any in the subprocess.run wrapper
+  "SIM115", # the trace handle deliberately outlives a block
+]
 # Allow certain useful patterns in tests
 "tests/**/*.py" = [
     "S101", # allow assert statements within if statements

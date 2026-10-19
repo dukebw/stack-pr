@@ -7,7 +7,7 @@ requests, branch pushes, reordering, removal, and merge state are delegated to
 
 ## Requirements
 
-- Git
+- Git 2.40 or newer, for `git merge-tree --write-tree --merge-base`
 - GitHub CLI authenticated for the repository
 - The paired `dukebw/gh-stack` extension, which provides reconciliation protocol v1
 
@@ -39,12 +39,13 @@ stack-pr view
 stack-pr export
 ```
 
-`view` does not change the source branch or GitHub. It fetches the remote and
-replays local layers in a disposable worktree so `synced` means their content,
-metadata, parent chain, and target all match the native stack. `export` requires
-a clean working tree, adds stable branch identities to commits that do not have
-one, replays active patches onto the latest target, and invokes the native
-reconciler. The source branch is never pushed. Human-readable commands report
+`view` does not change the source branch, the working tree, or GitHub. It
+fetches the remote and replays local layers with `git merge-tree` into the
+object database, so `synced` means their content, metadata, parent chain, and
+target all match the native stack without anything being checked out. `export`
+requires a clean working tree, adds stable branch identities to commits that do
+not have one, replays active patches onto the latest target, and invokes the
+native reconciler. The source branch is never pushed. Human-readable commands report
 timed stages on stderr; `--json` remains quiet.
 
 Adding a branch identity rewrites that commit and its descendants. As with the

@@ -1,5 +1,9 @@
 # Top of tree
 
+* Replay layers with `git merge-tree` in the object database instead of a disposable worktree. `view` and `export` no longer check out, reset, or otherwise touch a working tree, which removes the dominant cost on large repositories.
+* Read every commit in the selected range with two git processes instead of three per commit.
+* Require git 2.40 or newer.
+
 # Version 1.0.3
 
 * Include pending native Stack operations when deciding whether local commits are synchronized.

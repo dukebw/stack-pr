@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from stack_pr.git import StackPrError
+from stack_pr.git import StackPrError, require_git_version
 
 PROTOCOL_VERSION = 1
 LAYER_STATUSES = {
@@ -139,6 +139,7 @@ def _blocker_text(blocker: object) -> str:
 
 
 def preflight(repo: Path) -> None:
+    require_git_version(repo)
     result = subprocess.run(
         ["gh", "stack", "reconcile", "--protocol-version"],
         cwd=repo,

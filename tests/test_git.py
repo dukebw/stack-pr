@@ -9,6 +9,8 @@ from stack_pr.git import (
     assign_missing_identities,
     insert_missing_identities,
     load_linear_range,
+    read_commit,
+    read_commits,
 )
 
 from .conftest import Repo
@@ -88,3 +90,40 @@ def test_generated_identity_is_fixed_opaque_name(repo: Repo) -> None:
     )
     assert assigned[0].branch == "octocat/stack/abcdefabcdefabcdefabcdefabcdefab"
     assert re.fullmatch(r"octocat/stack/[0-9a-f]{32}", assigned[0].branch or "")
+
+
+def test_batched_read_preserves_raw_message_bytes(repo: Repo) -> None:
+    # `commit-tree` stores the message verbatim (unlike `git commit`, which
+    # strips trailing blank lines and appends a newline), so these shapes
+    # actually reach the parser.
+    messages = [
+        "Plain subject\n\nBody \u00fcn\u00efcode.\n",
+        "No trailing newline\n\nBody without final newline",
+        "Trailing blanks\n\nBody\n\n\n",
+    ]
+    shas: list[str] = []
+    parent = repo.root
+    for message in messages:
+        tree = repo.output("rev-parse", f"{parent}^{{tree}}")
+        sha = repo.git(
+            "commit-tree", tree, "-p", parent, "-F", "-", input_text=message
+        ).stdout.strip()
+        shas.append(sha)
+        parent = sha
+
+    commits = read_commits(repo.path, shas)
+
+    assert [commit.sha for commit in commits] == shas
+    assert [commit.message for commit in commits] == messages
+    assert [commit.message for commit in commits] == [
+        repo.git("cat-file", "commit", sha).stdout.partition("\n\n")[2] for sha in shas
+    ]
+    assert [commit.parents for commit in commits] == [
+        (repo.root,),
+        (shas[0],),
+        (shas[1],),
+    ]
+    assert [commit.tree for commit in commits] == [
+        repo.output("rev-parse", f"{sha}^{{tree}}") for sha in shas
+    ]
+    assert read_commit(repo.path, "HEAD").sha == repo.output("rev-parse", "HEAD")

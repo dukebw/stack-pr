@@ -13,7 +13,6 @@ from stack_pr.git import (
     check_source_upstream,
     current_branch,
     current_head,
-    detached_worktree,
     fetch_remote,
     infer_target,
     insert_missing_identities,
@@ -132,18 +131,12 @@ def view(
                     repo, commit, result_layer.head_sha, options.remote
                 )
 
-        with (
-            detached_worktree(
-                repo, f"{options.remote}/{target}"
-            ) as comparison_worktree,
-            materialize_layers(
-                comparison_worktree,
-                candidates,
-                merged_branches=preliminary.merged_branches,
-                remote=options.remote,
-                target=target,
-                source_branch=None,
-            ),
+        with materialize_layers(
+            repo,
+            candidates,
+            merged_branches=preliminary.merged_branches,
+            remote=options.remote,
+            target=target,
         ):
             compared = reconcile(repo, manifest, dry_run=True)
     return WorkflowResult(manifest, compared)
@@ -202,7 +195,6 @@ def export(
             merged_branches=plan.merged_branches,
             remote=options.remote,
             target=target,
-            source_branch=source_branch,
         ):
             applied = reconcile(repo, manifest, dry_run=False)
     return WorkflowResult(manifest, applied)

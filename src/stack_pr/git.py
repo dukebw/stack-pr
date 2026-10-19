@@ -7,15 +7,21 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 
 class StackPrError(Exception):
     """A user-actionable stack-pr failure."""
 
 
+# `merge-tree --write-tree --merge-base` is the replay primitive; it landed in 2.40.
+MINIMUM_GIT_VERSION = (2, 40)
+GIT_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
+
 IDENTITY_KEY = "stack-pr-branch"
-COMMIT_METADATA_FIELD_COUNT = 6
+# `cat-file --batch` header: "<sha> <type> <size>".
+BATCH_HEADER_FIELD_COUNT = 3
+METADATA_FIELD_COUNT = 9
+METADATA_FORMAT = "%H%x00%T%x00%P%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI"
 IDENTITY_VALUE_RE = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/stack/[0-9a-f]{32}"
 )
@@ -101,6 +107,20 @@ def git(
 
 def git_output(repo: Path, *args: str) -> str:
     return git(repo, *args).stdout.rstrip("\n")
+
+
+def require_git_version(repo: Path) -> None:
+    raw = git_output(repo, "version")
+    match = GIT_VERSION_RE.search(raw)
+    if match is None:
+        raise StackPrError(f"could not determine the git version from {raw!r}")
+    installed = (int(match.group(1)), int(match.group(2)))
+    if installed < MINIMUM_GIT_VERSION:
+        raise StackPrError(
+            f"git {installed[0]}.{installed[1]} is too old; stack-pr needs "
+            f"git {MINIMUM_GIT_VERSION[0]}.{MINIMUM_GIT_VERSION[1]} or newer for "
+            "`git merge-tree --write-tree --merge-base`. Upgrade git and retry."
+        )
 
 
 def repository_root(path: Path) -> Path:
@@ -222,46 +242,84 @@ def _parse_identity(message: str, sha: str) -> str | None:
     return branch
 
 
-def read_commit(repo: Path, sha: str) -> Commit:
-    resolved_sha = git_output(repo, "rev-parse", sha)
-    raw = git(repo, "cat-file", "commit", resolved_sha).stdout
-    header, separator, message = raw.partition("\n\n")
-    if not separator:
-        raise StackPrError(f"commit {resolved_sha[:12]} has no message")
-
-    tree = ""
-    parents: list[str] = []
-    for line in header.splitlines():
-        if line.startswith("tree "):
-            tree = line.removeprefix("tree ")
-        elif line.startswith("parent "):
-            parents.append(line.removeprefix("parent "))
-    if not tree:
-        raise StackPrError(f"commit {resolved_sha[:12]} has no tree")
-
-    metadata = git_output(
-        repo,
-        "show",
-        "-s",
-        "--format=%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI",
-        resolved_sha,
-    ).split("\0")
-    if len(metadata) != COMMIT_METADATA_FIELD_COUNT:
-        raise StackPrError(f"could not read metadata for commit {resolved_sha[:12]}")
-
-    return Commit(
-        sha=resolved_sha,
-        parents=tuple(parents),
-        tree=tree,
-        message=message,
-        author_name=metadata[0],
-        author_email=metadata[1],
-        author_date=metadata[2],
-        committer_name=metadata[3],
-        committer_email=metadata[4],
-        committer_date=metadata[5],
-        branch=_parse_identity(message, resolved_sha),
+def _commit_messages(repo: Path, shas: Sequence[str]) -> list[str]:
+    """Read raw commit bodies in one process, preserving message bytes exactly."""
+    result = subprocess.run(
+        ["git", "cat-file", "--batch"],
+        cwd=repo,
+        input=("\n".join(shas) + "\n").encode(),
+        capture_output=True,
+        check=True,
     )
+    payload = result.stdout
+    messages: list[str] = []
+    offset = 0
+    for _ in shas:
+        newline = payload.index(b"\n", offset)
+        header = payload[offset:newline].decode()
+        fields = header.split()
+        if len(fields) != BATCH_HEADER_FIELD_COUNT or fields[1] != "commit":
+            raise StackPrError(f"could not read commit object {header!r}")
+        size = int(fields[2])
+        start = newline + 1
+        raw = payload[start : start + size]
+        offset = start + size + 1
+        _, separator, message = raw.partition(b"\n\n")
+        if not separator:
+            raise StackPrError(f"commit {fields[0][:12]} has no message")
+        messages.append(message.decode())
+    return messages
+
+
+def read_commits(repo: Path, shas: Sequence[str]) -> list[Commit]:
+    """Read many commits in two processes, whatever the count."""
+    if not shas:
+        return []
+    rows = git(
+        repo,
+        "log",
+        "--no-walk=unsorted",
+        "-z",
+        f"--format={METADATA_FORMAT}",
+        *shas,
+    ).stdout.split("\0")
+    if rows and rows[-1] == "":
+        rows.pop()
+    if len(rows) != len(shas) * METADATA_FIELD_COUNT:
+        raise StackPrError(
+            f"expected metadata for {len(shas)} commits, "
+            f"read {len(rows) // METADATA_FIELD_COUNT}"
+        )
+
+    messages = _commit_messages(
+        repo, [rows[index * METADATA_FIELD_COUNT] for index in range(len(shas))]
+    )
+    commits: list[Commit] = []
+    for index, message in enumerate(messages):
+        fields = rows[index * METADATA_FIELD_COUNT : (index + 1) * METADATA_FIELD_COUNT]
+        sha, tree, parents_text, *metadata = fields
+        if not tree:
+            raise StackPrError(f"commit {sha[:12]} has no tree")
+        commits.append(
+            Commit(
+                sha=sha,
+                parents=tuple(parents_text.split()) if parents_text else (),
+                tree=tree,
+                message=message,
+                author_name=metadata[0],
+                author_email=metadata[1],
+                author_date=metadata[2],
+                committer_name=metadata[3],
+                committer_email=metadata[4],
+                committer_date=metadata[5],
+                branch=_parse_identity(message, sha),
+            )
+        )
+    return commits
+
+
+def read_commit(repo: Path, sha: str) -> Commit:
+    return read_commits(repo, [sha])[0]
 
 
 def load_linear_range(repo: Path, base: str, head: str) -> list[Commit]:
@@ -273,7 +331,7 @@ def load_linear_range(repo: Path, base: str, head: str) -> list[Commit]:
     shas = git_output(
         repo, "rev-list", "--reverse", "--topo-order", f"{base_sha}..{head_sha}"
     ).splitlines()
-    commits = [read_commit(repo, sha) for sha in shas]
+    commits = read_commits(repo, shas)
     expected_parent = base_sha
     for commit in commits:
         if commit.parents != (expected_parent,):
@@ -426,12 +484,14 @@ def insert_missing_identities(
             "source branch changed while identities were inserted"
         ) from exc
 
+    new_shas = [
+        rewritten.get(original.sha, original.sha) for original in original_commits
+    ]
     updated: list[Commit] = []
-    for original, assigned in zip(original_commits, assigned_commits):
-        new_sha = rewritten.get(original.sha, original.sha)
+    for commit, assigned in zip(read_commits(repo, new_shas), assigned_commits):
         if assigned.branch is None:
-            raise StackPrError(f"commit {original.sha[:12]} has no assigned identity")
-        updated.append(read_commit(repo, new_sha).with_branch(assigned.branch))
+            raise StackPrError(f"commit {commit.sha[:12]} has no assigned identity")
+        updated.append(commit.with_branch(assigned.branch))
     validate_unique_identities(updated)
     return updated
 
@@ -506,18 +566,51 @@ def require_merged_patch_unchanged(
         )
 
 
-def _local_branch_exists(repo: Path, branch: str) -> bool:
-    return (
-        git(
-            repo,
-            "show-ref",
-            "--verify",
-            "--quiet",
-            f"refs/heads/{branch}",
-            check=False,
-        ).returncode
-        == 0
+def _replay_tree(repo: Path, commit: Commit, parent: str, target_label: str) -> str:
+    """Replay one commit's change onto `parent`, entirely in the object database.
+
+    `merge-tree --merge-base` runs the same three-way merge as `cherry-pick`
+    without reading or writing the index or working tree.
+    """
+    if not commit.parents:
+        raise StackPrError(f"commit {commit.sha[:12]} has no parent to replay from")
+    result = git(
+        repo,
+        "merge-tree",
+        "--write-tree",
+        f"--merge-base={commit.parents[0]}",
+        parent,
+        commit.sha,
+        check=False,
     )
+    lines = result.stdout.splitlines()
+    if result.returncode != 0 or not lines:
+        detail = (
+            "\n".join(line for line in lines[1:] if line.strip())
+            or result.stderr.strip()
+            or "patch did not apply"
+        )
+        raise StackPrError(
+            f"could not replay commit {commit.sha[:12]} onto {target_label}: {detail}"
+        )
+    return lines[0].strip()
+
+
+def _local_branch_names(repo: Path) -> set[str]:
+    listed = git_output(
+        repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/"
+    )
+    return set(listed.splitlines())
+
+
+def _update_refs(repo: Path, updates: Sequence[tuple[str, str | None]]) -> None:
+    if not updates:
+        return
+    lines = [
+        f"delete {ref}" if value is None else f"update {ref} {value}"
+        for ref, value in updates
+    ]
+    git(repo, "update-ref", "--stdin", input_text="\n".join(lines) + "\n")
 
 
 @contextmanager
@@ -528,70 +621,35 @@ def materialize_layers(
     merged_branches: set[str],
     remote: str,
     target: str,
-    source_branch: str | None,
 ) -> Iterator[None]:
+    """Publish active layers as local branches replayed onto the target.
+
+    Every layer is built with `commit-tree` from a tree written by `merge-tree`,
+    so the caller's checkout, index and working tree are never touched.
+    """
     active = [commit for commit in commits if commit.branch not in merged_branches]
+    existing = _local_branch_names(repo)
     for commit in active:
         if commit.branch is None:
             raise StackPrError(f"commit {commit.sha[:12]} has no branch identity")
-        if _local_branch_exists(repo, commit.branch):
+        if commit.branch in existing:
             raise StackPrError(
                 f"temporary layer branch {commit.branch!r} already exists locally"
             )
 
-    created: list[str] = []
-    detached = False
+    target_label = f"{remote}/{target}"
+    parent = git_output(repo, "rev-parse", target_label)
+    created: list[tuple[str, str | None]] = []
     try:
-        git(repo, "checkout", "--detach", f"{remote}/{target}")
-        detached = True
+        replayed: list[tuple[str, str]] = []
         for commit in active:
-            branch = commit.branch
-            if branch is None:
+            if commit.branch is None:
                 raise StackPrError(f"commit {commit.sha[:12]} has no branch identity")
-            cherry_pick = git(
-                repo, "cherry-pick", "--no-commit", commit.sha, check=False
-            )
-            if cherry_pick.returncode != 0:
-                detail = cherry_pick.stderr.strip() or "patch did not apply"
-                raise StackPrError(
-                    f"could not replay commit {commit.sha[:12]} onto {remote}/{target}: "
-                    f"{detail}"
-                )
-            tree = git_output(repo, "write-tree")
-            parent = current_head(repo)
-            materialized_sha = _commit_tree(
-                repo, commit, parent, commit.message, tree=tree
-            )
-            git(repo, "reset", "--hard", materialized_sha)
-            git(repo, "update-ref", f"refs/heads/{branch}", materialized_sha)
-            created.append(branch)
-
-        if source_branch is not None:
-            git(repo, "checkout", source_branch)
-            detached = False
+            tree = _replay_tree(repo, commit, parent, target_label)
+            parent = _commit_tree(repo, commit, parent, commit.message, tree=tree)
+            replayed.append((f"refs/heads/{commit.branch}", parent))
+        _update_refs(repo, replayed)
+        created = [(ref, None) for ref, _value in replayed]
         yield
     finally:
-        git(repo, "cherry-pick", "--abort", check=False)
-        if source_branch is not None and (
-            detached or current_branch_if_attached(repo) != source_branch
-        ):
-            git(repo, "reset", "--hard", check=False)
-            git(repo, "checkout", source_branch, check=False)
-        for branch in created:
-            git(repo, "update-ref", "-d", f"refs/heads/{branch}", check=False)
-
-
-@contextmanager
-def detached_worktree(repo: Path, start_ref: str) -> Iterator[Path]:
-    with TemporaryDirectory(prefix="stack-pr-view-") as temporary_dir:
-        worktree = Path(temporary_dir) / "worktree"
-        git(repo, "worktree", "add", "--detach", str(worktree), start_ref)
-        try:
-            yield worktree
-        finally:
-            git(repo, "worktree", "remove", "--force", str(worktree), check=False)
-
-
-def current_branch_if_attached(repo: Path) -> str | None:
-    result = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
-    return result.stdout.strip() if result.returncode == 0 else None
+        _update_refs(repo, created)

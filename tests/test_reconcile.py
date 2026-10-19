@@ -52,6 +52,8 @@ def test_reconcile_subprocess_uses_native_protocol(
     def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         input_value = kwargs.get("input")
         calls.append((args, input_value if isinstance(input_value, str) else None))
+        if args[:2] == ["git", "version"]:
+            return subprocess.CompletedProcess(args, 0, "git version 2.54.0\n", "")
         if args[-1] == "--protocol-version":
             return subprocess.CompletedProcess(
                 args,
@@ -88,16 +90,15 @@ def test_reconcile_subprocess_uses_native_protocol(
     preflight(tmp_path)
     result = reconcile(tmp_path, manifest, dry_run=True)
 
-    assert calls[1][0] == [
-        "gh",
-        "stack",
-        "reconcile",
-        "--input",
-        "-",
-        "--json",
-        "--dry-run",
+    replayed = [
+        (args, payload)
+        for args, payload in calls
+        if args[:3] == ["gh", "stack", "reconcile"] and "--input" in args
     ]
-    assert json.loads(calls[1][1] or "") == manifest.to_dict()
+    assert [args for args, _payload in replayed] == [
+        ["gh", "stack", "reconcile", "--input", "-", "--json", "--dry-run"]
+    ]
+    assert json.loads(replayed[0][1] or "") == manifest.to_dict()
     assert result.layers[0].status == "create"
 
 
@@ -210,8 +211,36 @@ def test_preflight_rejects_extension_without_protocol_version(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ["git", "version"]:
+            return subprocess.CompletedProcess(args, 0, "git version 2.54.0\n", "")
         return subprocess.CompletedProcess(args, 0, "dev\n", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     with pytest.raises(StackPrError, match="does not support"):
         preflight(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("reported", "allowed"),
+    [
+        ("git version 2.39.5 (Apple Git-154)", False),
+        ("git version 2.40.0", True),
+        ("git version 2.54.0 (Apple Git-157)", True),
+    ],
+)
+def test_preflight_gates_on_git_version(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    reported: str,
+    allowed: bool,
+) -> None:
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        stdout = reported + "\n" if args[:2] == ["git", "version"] else "1\n"
+        return subprocess.CompletedProcess(args, 0, stdout, "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    if allowed:
+        preflight(tmp_path)
+    else:
+        with pytest.raises(StackPrError, match="too old"):
+            preflight(tmp_path)

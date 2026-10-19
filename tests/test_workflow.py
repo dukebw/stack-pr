@@ -198,9 +198,19 @@ def test_export_replays_patch_onto_moved_target(
         return _result(manifest, ["create"])
 
     monkeypatch.setattr(workflow, "reconcile", fake_reconcile)
+    before_status = repo.output("status", "--porcelain")
+    before_index = repo.output("ls-files", "-s")
+
     workflow.export(repo.path, Options(None, "HEAD", None, "origin"), progress=progress)
 
     assert repo.output("branch", "--show-current") == "feature"
+    # Replay happens in the object database, so publishing leaves the caller's
+    # checkout, index and worktree untouched. HEAD moves only because the
+    # source branch is rewritten to carry the trailer.
+    assert repo.output("status", "--porcelain") == before_status
+    assert repo.output("ls-files", "-s") == before_index
+    listing = repo.output("worktree", "list", "--porcelain").splitlines()
+    assert sum(1 for line in listing if line.startswith("worktree ")) == 1
     assert (
         repo.git(
             "show-ref", "--verify", f"refs/heads/{applied_branch}", check=False
