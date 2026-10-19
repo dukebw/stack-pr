@@ -45,8 +45,10 @@ def _result(
     return parse_result(payload)
 
 
-def _mock_identity_and_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(workflow, "preflight", lambda repo: None)
+def _mock_identity_and_preflight(
+    monkeypatch: pytest.MonkeyPatch, *, protocol: int = 1
+) -> None:
+    monkeypatch.setattr(workflow, "preflight", lambda repo: protocol)
     monkeypatch.setattr(workflow, "github_login", lambda repo: "octocat")
 
 
@@ -217,8 +219,6 @@ def test_export_replays_patch_onto_moved_target(
     assert progress_events == [
         "start:Fetching origin and planning",
         "done:Fetching origin and planning",
-        "start:Checking 1 layer against origin/master",
-        "done:Checking 1 layer against origin/master",
         "start:Publishing 1 layer",
         "done:Publishing 1 layer",
     ]
@@ -267,6 +267,96 @@ def test_export_skips_merged_layer_when_materializing(
         != 0
         for branch in branches
     )
+
+
+def test_view_compares_exported_stack_in_one_v2_call(
+    repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    branch = "octocat/stack/11111111111111111111111111111111"
+    repo.commit_file(
+        "feature.txt", "feature\n", f"Feature\n\nstack-pr-branch: {branch}\n"
+    )
+    _mock_identity_and_preflight(monkeypatch, protocol=2)
+    calls: list[bool] = []
+
+    def fake_reconcile(
+        path: object, manifest: Manifest, *, dry_run: bool
+    ) -> ReconcileResult:
+        assert dry_run
+        calls.append(manifest.assume_unmerged)
+        assert (
+            repo.git(
+                "show-ref", "--verify", f"refs/heads/{branch}", check=False
+            ).returncode
+            == 0
+        )
+        return _result(manifest, ["none"])
+
+    monkeypatch.setattr(workflow, "reconcile", fake_reconcile)
+
+    workflow.view(repo.path, Options(None, "HEAD", None, "origin"))
+
+    assert calls == [True]
+
+
+def test_export_rebuilds_without_layer_merged_under_v2(
+    repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    one = "octocat/stack/11111111111111111111111111111111"
+    two = "octocat/stack/22222222222222222222222222222222"
+    first = repo.commit_file("one.txt", "one\n", f"One\n\nstack-pr-branch: {one}\n")
+    repo.commit_file("two.txt", "two\n", f"Two\n\nstack-pr-branch: {two}\n")
+    repo.git("switch", "master")
+    repo.git("cherry-pick", "--no-gpg-sign", first)
+    repo.git("push", "origin", "master")
+    repo.git("switch", "feature")
+    _mock_identity_and_preflight(monkeypatch, protocol=2)
+    calls: list[tuple[bool, bool]] = []
+
+    def materialized(branch: str) -> bool:
+        return (
+            repo.git(
+                "show-ref", "--verify", f"refs/heads/{branch}", check=False
+            ).returncode
+            == 0
+        )
+
+    def fake_reconcile(
+        path: object, manifest: Manifest, *, dry_run: bool
+    ) -> ReconcileResult:
+        calls.append((manifest.assume_unmerged, dry_run))
+        if manifest.assume_unmerged:
+            assert materialized(one)
+            assert materialized(two)
+            return parse_result(
+                {
+                    "version": 2,
+                    "layers": [
+                        {
+                            "branch": one,
+                            "status": "merged",
+                            "action": "blocked",
+                            "pr": {"number": 10, "merged": True, "head_sha": first},
+                        },
+                        {"branch": two, "status": "open", "action": "update"},
+                    ],
+                    "blockers": [
+                        {"code": "merged_layer", "message": "merged", "branch": one}
+                    ],
+                }
+            )
+        assert not materialized(one)
+        assert repo.output("rev-parse", f"{two}^") == repo.output(
+            "rev-parse", "origin/master"
+        )
+        return _result(manifest, ["merged", "update"])
+
+    monkeypatch.setattr(workflow, "reconcile", fake_reconcile)
+
+    workflow.export(repo.path, Options(repo.root, "HEAD", "master", "origin"))
+
+    # The blocked call already reported the merged layer, so no extra plan.
+    assert calls == [(True, False), (False, False)]
 
 
 def test_export_rejects_changed_merged_layer(

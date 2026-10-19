@@ -22,7 +22,8 @@ import sys
 import time
 from pathlib import Path
 
-PROTOCOL_VERSION = 1
+# Newest protocol answered; results echo the manifest version.
+PROTOCOL_VERSION = 2
 
 
 def _record(entry: dict[str, object]) -> None:
@@ -45,9 +46,9 @@ def _branches_present(branches: list[str]) -> dict[str, bool]:
     return present
 
 
-def _blocked_result() -> dict[str, object]:
+def _blocked_result(version: object) -> dict[str, object]:
     return {
-        "version": PROTOCOL_VERSION,
+        "version": version,
         "dry_run": True,
         "layers": [],
         "removed_managed_layers": [],
@@ -87,7 +88,7 @@ def _layered_result(manifest: dict[str, object]) -> dict[str, object]:
             }
         )
     return {
-        "version": PROTOCOL_VERSION,
+        "version": manifest.get("version", PROTOCOL_VERSION),
         "dry_run": True,
         "layers": built,
         "removed_managed_layers": [],
@@ -111,7 +112,7 @@ def _reconcile(args: list[str]) -> int:
 
     status = os.environ.get("SP_GH_STATUS", "create")
     if status == "blocked":
-        payload = _blocked_result()
+        payload = _blocked_result(manifest.get("version", PROTOCOL_VERSION))
     elif status == "create":
         payload = _layered_result(manifest)
     else:

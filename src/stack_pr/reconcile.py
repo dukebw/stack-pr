@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from stack_pr.git import StackPrError, require_git_version
 
 PROTOCOL_VERSION = 1
+# v2 adds the manifest's assume_unmerged flag.
+ASSUME_UNMERGED_VERSION = 2
+PROTOCOL_VERSIONS = (PROTOCOL_VERSION, ASSUME_UNMERGED_VERSION)
+MERGED_LAYER_BLOCKER = "merged_layer"
 LAYER_STATUSES = {
     "blocked",
     "create",
@@ -45,14 +49,22 @@ class Manifest:
     remote: str
     layers: tuple[ManifestLayer, ...]
     version: int = PROTOCOL_VERSION
+    assume_unmerged: bool = False
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "version": self.version,
             "base": self.base,
             "remote": self.remote,
             "layers": [layer.to_dict() for layer in self.layers],
         }
+        if self.assume_unmerged:
+            payload["assume_unmerged"] = True
+        return payload
+
+    def assuming_unmerged(self) -> Manifest:
+        """This manifest for layers materialized as if none were merged."""
+        return replace(self, version=ASSUME_UNMERGED_VERSION, assume_unmerged=True)
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), separators=(",", ":"))
@@ -100,6 +112,29 @@ class ReconcileResult:
         return list(dict.fromkeys(blockers))
 
     @property
+    def merged_layer_blocked(self) -> bool:
+        raw_blockers = self.raw.get("blockers")
+        return isinstance(raw_blockers, list) and any(
+            isinstance(blocker, dict) and blocker.get("code") == MERGED_LAYER_BLOCKER
+            for blocker in raw_blockers
+        )
+
+    def without_merged_layer_blockers(self) -> ReconcileResult:
+        """This result as a plan that did not assume every layer unmerged."""
+        raw_blockers = self.raw.get("blockers")
+        if not isinstance(raw_blockers, list):
+            return self
+        kept = [
+            blocker
+            for blocker in raw_blockers
+            if not (
+                isinstance(blocker, dict)
+                and blocker.get("code") == MERGED_LAYER_BLOCKER
+            )
+        ]
+        return replace(self, raw={**self.raw, "blockers": kept})
+
+    @property
     def has_native_stack(self) -> bool:
         stack = self.raw.get("stack")
         return bool(stack) or isinstance(self.raw.get("stack_url"), str)
@@ -138,7 +173,8 @@ def _blocker_text(blocker: object) -> str:
     return str(blocker)
 
 
-def preflight(repo: Path) -> None:
+def preflight(repo: Path) -> int:
+    """Check the toolchain and return the reconcile protocol version to speak."""
     require_git_version(repo)
     result = subprocess.run(
         ["gh", "stack", "reconcile", "--protocol-version"],
@@ -147,12 +183,14 @@ def preflight(repo: Path) -> None:
         capture_output=True,
         check=False,
     )
-    if result.returncode != 0 or result.stdout.strip() != str(PROTOCOL_VERSION):
+    reported = result.stdout.strip()
+    if result.returncode != 0 or reported not in {str(v) for v in PROTOCOL_VERSIONS}:
         raise StackPrError(
-            "installed gh stack does not support reconcile protocol v1; "
+            "installed gh stack does not support reconcile protocol v1 or v2; "
             "install the paired extension with `gh extension remove stack` then "
             "`gh extension install dukebw/gh-stack`"
         )
+    return int(reported)
 
 
 def github_login(repo: Path) -> str:
@@ -194,7 +232,13 @@ def reconcile(repo: Path, manifest: Manifest, *, dry_run: bool) -> ReconcileResu
         parsed = parse_result(payload)
 
     if result.returncode != 0:
-        if dry_run and parsed is not None and parsed.blockers:
+        # A merged_layer block happens before any mutation, so the caller can
+        # rebuild the layers and reconcile again.
+        if (
+            parsed is not None
+            and parsed.blockers
+            and (dry_run or parsed.merged_layer_blocked)
+        ):
             return parsed
         blockers = "; ".join(parsed.blockers) if parsed is not None else ""
         detail = (
@@ -293,7 +337,7 @@ def _parse_layers(
 def parse_result(payload: object) -> ReconcileResult:
     if not isinstance(payload, dict):
         raise StackPrError("gh stack reconcile returned a non-object response")
-    if payload.get("version") != PROTOCOL_VERSION:
+    if payload.get("version") not in PROTOCOL_VERSIONS:
         raise StackPrError(
             "gh stack reconcile returned an unsupported protocol version"
         )

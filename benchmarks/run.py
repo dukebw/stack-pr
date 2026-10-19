@@ -70,8 +70,9 @@ WORKLOADS: dict[str, Workload] = {
         required_calls=("git merge-tree", "git fast-import", "git update-ref"),
         # Replay is object-database only: no checkout, no worktree, no reset.
         forbidden_calls=("git worktree", "git cherry-pick", "git reset"),
-        reconciles=2,
-        # A view of unexported commits skips the preliminary reconcile.
+        # One reconcile compares the replayed layers; unexported commits are
+        # compared during the fetch.
+        reconciles=1,
         unexported_reconciles=1,
     ),
     "export": Workload(
@@ -80,7 +81,9 @@ WORKLOADS: dict[str, Workload] = {
         mutates=True,
         required_calls=("git merge-tree", "git fast-import", "git update-ref"),
         forbidden_calls=("git worktree", "git cherry-pick", "git reset"),
-        reconciles=2,
+        # Identities let one reconcile plan and apply; without them a plan
+        # must clear the stack before commits are rewritten.
+        reconciles=1,
         unexported_reconciles=2,
     ),
 }
@@ -188,6 +191,7 @@ def _check(workload: Workload, run: Run, *, trailers: bool) -> None:
 
 def _verify_materialized(fixture: Fixture, workload: Workload, delay_ms: int) -> bool:
     """Prove the last reconcile observed the materialized layer branches."""
+    fixture.restore()
     run = _invoke(fixture, workload, delay_ms=delay_ms, verify=True)
     _check(workload, run, trailers=fixture.trailers)
     present = run.calls[-1].get("branches_present") or {}

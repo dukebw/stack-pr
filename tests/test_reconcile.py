@@ -106,7 +106,7 @@ def test_reconcile_rejects_wrong_protocol_version(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(args, 0, '{"version":2,"layers":[]}', "")
+        return subprocess.CompletedProcess(args, 0, '{"version":3,"layers":[]}', "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     with pytest.raises(StackPrError, match="unsupported protocol version"):

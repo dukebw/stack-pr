@@ -27,6 +27,7 @@ from stack_pr.git import (
     upstream_refspec,
 )
 from stack_pr.reconcile import (
+    ASSUME_UNMERGED_VERSION,
     Manifest,
     ManifestLayer,
     ReconcileResult,
@@ -117,6 +118,7 @@ class _Plan:
     candidates: list[Commit]
     manifest: Manifest
     preliminary: ReconcileResult | None
+    protocol: int | None = None
 
 
 def _plan(
@@ -150,7 +152,7 @@ def _fetch_and_plan(
     refspecs: list[str],
     login: str | None,
     draft: bool,
-    preliminary: Callable[[list[Commit]], bool],
+    preliminary: Callable[[list[Commit], Callable[[], int]], bool],
 ) -> _Plan:
     """Fetch the remote while planning against the target fetched last time.
 
@@ -158,10 +160,14 @@ def _fetch_and_plan(
     commits from it, so the plan usually stands; it is redone when the range
     differs, or when the stale target could not be used. Only `refspecs` are
     fetched: a full fetch of a repository with many branches costs seconds.
+
+    `preliminary` decides from the commits and the protocol version whether
+    the plan includes a dry-run reconcile.
     """
     stale: _Range | None = None
     speculative: _Plan | None = None
-    checking: Future[None] | None = None
+    checking: Future[int] | None = None
+    protocol: int | None = None
     with ThreadPoolExecutor(max_workers=2) as pool:
         fetching = pool.submit(fetch_remote, repo, options.remote, refspecs)
         try:
@@ -174,36 +180,48 @@ def _fetch_and_plan(
                     stale,
                     login=login,
                     draft=draft,
-                    preliminary=preliminary(stale.commits),
+                    preliminary=preliminary(stale.commits, checking.result),
                 )
         except StackPrError:
             # Redone below, so fetch and preflight errors take precedence.
             stale = speculative = None
         fetching.result()
         if checking is not None:
-            checking.result()
+            protocol = checking.result()
     if stale is None:
         fresh = _resolve_range(repo, options, target)
     else:
         fresh = _refetched_range(repo, options, stale)
+    if fresh.commits and protocol is None:
+        protocol = preflight(repo)
     if speculative is not None and [c.sha for c in speculative.commits] == [
         c.sha for c in fresh.commits
     ]:
-        return speculative
-    if fresh.commits and checking is None:
-        preflight(repo)
-    return _plan(
+        return replace(speculative, protocol=protocol)
+    planned = _plan(
         repo,
         options,
         fresh,
         login=login,
         draft=draft,
-        preliminary=preliminary(fresh.commits),
+        preliminary=bool(fresh.commits)
+        and preliminary(fresh.commits, lambda: _require(protocol)),
     )
+    return replace(planned, protocol=protocol)
+
+
+def _require(protocol: int | None) -> int:
+    if protocol is None:
+        raise StackPrError("reconcile protocol version is unknown")
+    return protocol
 
 
 def _has_identity(commits: list[Commit]) -> bool:
     return any(commit.branch is not None for commit in commits)
+
+
+def _all_identified(commits: list[Commit]) -> bool:
+    return all(commit.branch is not None for commit in commits)
 
 
 def _manifest(
@@ -224,6 +242,32 @@ def _manifest(
     return Manifest(base=target, remote=remote, layers=tuple(layers))
 
 
+def _require_merged_patches_unchanged(
+    repo: Path, candidates: list[Commit], plan: ReconcileResult, remote: str
+) -> None:
+    result_by_branch = {layer.branch: layer for layer in plan.layers}
+    for commit in candidates:
+        if commit.branch is None:
+            raise StackPrError(f"commit {commit.sha[:12]} has no branch identity")
+        result_layer = result_by_branch.get(commit.branch)
+        if result_layer is not None and result_layer.status == "merged":
+            require_merged_patch_unchanged(repo, commit, result_layer.head_sha, remote)
+
+
+def _plan_from_merged_block(
+    repo: Path, manifest: Manifest, blocked: ReconcileResult
+) -> ReconcileResult:
+    """Turn a result blocked by merged layers into the plan it stands in for.
+
+    Its merged layers and their heads came from GitHub and stand. Any other
+    blocker may stem from layers built on a merged one, so then plan afresh.
+    """
+    plan = blocked.without_merged_layer_blockers()
+    if plan.blockers:
+        return reconcile(repo, manifest, dry_run=True)
+    return plan
+
+
 def view(
     repo: Path, options: Options, *, progress: Progress | None = None
 ) -> WorkflowResult:
@@ -237,30 +281,38 @@ def view(
             refspecs=[tracking_refspec(options.remote, target)],
             login=VIEW_LOGIN,
             draft=False,
-            preliminary=lambda _commits: True,
+            # Unexported commits have no PRs, so their plan is the comparison.
+            # Otherwise a v2 extension compares in one call after replaying.
+            preliminary=lambda commits, protocol: (
+                not _has_identity(commits) or protocol() < ASSUME_UNMERGED_VERSION
+            ),
         )
     commits, candidates, manifest = (
         planned.commits,
         planned.candidates,
         planned.manifest,
     )
-    preliminary = planned.preliminary
-    if preliminary is None:
+    if not commits:
         return WorkflowResult(manifest, None)
 
     count = _layer_count(len(commits))
     with step(f"Comparing {count} with {options.remote}/{target}"):
+        preliminary = planned.preliminary
+        if preliminary is None:
+            with materialize_layers(
+                repo,
+                candidates,
+                merged_branches=set(),
+                remote=options.remote,
+                target=target,
+            ):
+                compared = reconcile(repo, manifest.assuming_unmerged(), dry_run=True)
+            if not compared.merged_layer_blocked:
+                return WorkflowResult(manifest, compared)
+            preliminary = _plan_from_merged_block(repo, manifest, compared)
         if preliminary.blockers:
             return WorkflowResult(manifest, preliminary)
-        result_by_branch = {layer.branch: layer for layer in preliminary.layers}
-        for commit in candidates:
-            if commit.branch is None:
-                raise StackPrError(f"commit {commit.sha[:12]} has no branch identity")
-            result_layer = result_by_branch.get(commit.branch)
-            if result_layer is not None and result_layer.status == "merged":
-                require_merged_patch_unchanged(
-                    repo, commit, result_layer.head_sha, options.remote
-                )
+        _require_merged_patches_unchanged(repo, candidates, preliminary, options.remote)
 
         with materialize_layers(
             repo,
@@ -299,7 +351,12 @@ def export(
             refspecs=refspecs,
             login=None,
             draft=options.draft,
-            preliminary=lambda _commits: True,
+            # Commits without an identity are rewritten to carry one, so a
+            # plan must clear the stack first. Otherwise a v2 extension plans
+            # and applies in one call.
+            preliminary=lambda commits, protocol: (
+                not _all_identified(commits) or protocol() < ASSUME_UNMERGED_VERSION
+            ),
         )
         check_source_upstream(repo, source_branch, options.remote)
     commits, candidates, manifest = (
@@ -311,25 +368,25 @@ def export(
         return WorkflowResult(manifest, None)
 
     count = _layer_count(len(commits))
-    with step(f"Checking {count} against {options.remote}/{target}"):
-        plan = planned.preliminary
+    plan = planned.preliminary
+    with step(f"Publishing {count}"):
         if plan is None:
-            raise StackPrError("export planned no reconciliation")
+            with materialize_layers(
+                repo,
+                candidates,
+                merged_branches=set(),
+                remote=options.remote,
+                target=target,
+            ):
+                applied = reconcile(repo, manifest.assuming_unmerged(), dry_run=False)
+            if not applied.merged_layer_blocked:
+                return WorkflowResult(manifest, applied)
+            plan = _plan_from_merged_block(repo, manifest, applied)
         if plan.blockers:
             raise StackPrError(
                 "native reconciliation is blocked: " + "; ".join(plan.blockers)
             )
-        result_by_branch = {layer.branch: layer for layer in plan.layers}
-        for commit in candidates:
-            if commit.branch is None:
-                raise StackPrError(f"commit {commit.sha[:12]} has no branch identity")
-            result_layer = result_by_branch.get(commit.branch)
-            if result_layer is not None and result_layer.status == "merged":
-                require_merged_patch_unchanged(
-                    repo, commit, result_layer.head_sha, options.remote
-                )
-
-    with step(f"Publishing {count}"):
+        _require_merged_patches_unchanged(repo, candidates, plan, options.remote)
         identified = insert_missing_identities(
             repo,
             commits,

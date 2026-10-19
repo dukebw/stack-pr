@@ -31,8 +31,8 @@ Override any preset dimension:
 | workload | command | path |
 | --- | --- | --- |
 | `view-blocked` | `stack-pr view` | reconcile reports a blocker, so the run stops after one reconcile |
-| `view-clean` | `stack-pr view` | full path: object-database layer replay plus two reconciles, or one when no commit carries an identity yet (`--trailers none`) |
-| `export` | `stack-pr export` | plan reconcile, identity insert, replay, applying reconcile |
+| `view-clean` | `stack-pr view` | full path: object-database layer replay plus one reconcile |
+| `export` | `stack-pr export` | replay and one applying reconcile; with `--trailers none`, a plan reconcile and identity insert first |
 
 `export` mutates its clone, so the runner restores the fixture between reps.
 

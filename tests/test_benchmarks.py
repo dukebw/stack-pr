@@ -65,7 +65,7 @@ def test_shim_reports_protocol_version() -> None:
         env={"PATH": "/usr/bin:/bin"},
     )
 
-    assert result.stdout.strip() == "1"
+    assert result.stdout.strip() == "2"
 
 
 def test_shim_answers_login_lookup() -> None:
