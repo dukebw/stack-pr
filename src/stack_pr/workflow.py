@@ -226,10 +226,12 @@ def view(
 ) -> WorkflowResult:
     step = progress or _quiet_progress
     with step(f"Fetching {options.remote} and loading commits"):
-        # Commits without an identity were never exported, so none has a PR
-        # that could be merged, and the comparison reports any blocker itself.
         planned = _fetch_and_plan(
-            repo, options, login=VIEW_LOGIN, draft=False, preliminary=_has_identity
+            repo,
+            options,
+            login=VIEW_LOGIN,
+            draft=False,
+            preliminary=lambda _commits: True,
         )
     target, commits, candidates, manifest = (
         planned.target,
@@ -237,36 +239,36 @@ def view(
         planned.candidates,
         planned.manifest,
     )
-    if not commits:
+    preliminary = planned.preliminary
+    if preliminary is None:
         return WorkflowResult(manifest, None)
 
     count = _layer_count(len(commits))
     with step(f"Comparing {count} with {options.remote}/{target}"):
-        merged_branches: set[str] = set()
-        preliminary = planned.preliminary
-        if preliminary is not None:
-            if preliminary.blockers:
-                return WorkflowResult(manifest, preliminary)
-            result_by_branch = {layer.branch: layer for layer in preliminary.layers}
-            for commit in candidates:
-                if commit.branch is None:
-                    raise StackPrError(
-                        f"commit {commit.sha[:12]} has no branch identity"
-                    )
-                result_layer = result_by_branch.get(commit.branch)
-                if result_layer is not None and result_layer.status == "merged":
-                    require_merged_patch_unchanged(
-                        repo, commit, result_layer.head_sha, options.remote
-                    )
-            merged_branches = preliminary.merged_branches
+        if preliminary.blockers:
+            return WorkflowResult(manifest, preliminary)
+        result_by_branch = {layer.branch: layer for layer in preliminary.layers}
+        for commit in candidates:
+            if commit.branch is None:
+                raise StackPrError(f"commit {commit.sha[:12]} has no branch identity")
+            result_layer = result_by_branch.get(commit.branch)
+            if result_layer is not None and result_layer.status == "merged":
+                require_merged_patch_unchanged(
+                    repo, commit, result_layer.head_sha, options.remote
+                )
 
         with materialize_layers(
             repo,
             candidates,
-            merged_branches=merged_branches,
+            merged_branches=preliminary.merged_branches,
             remote=options.remote,
             target=target,
         ):
+            # Commits without an identity were never exported, so none has a
+            # PR to compare with the replayed layers and the plan already is
+            # the comparison; replaying only checks the stack still applies.
+            if not _has_identity(commits):
+                return WorkflowResult(manifest, preliminary)
             compared = reconcile(repo, manifest, dry_run=True)
     return WorkflowResult(manifest, compared)
 

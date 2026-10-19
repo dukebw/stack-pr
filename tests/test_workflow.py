@@ -72,15 +72,6 @@ def test_range_inference_and_view_purity(
         assert manifest.remote == "origin"
         reconcile_calls += 1
         planned_branches[:] = [layer.branch for layer in manifest.layers]
-        # Unexported commits have no PRs to look up first, so the only
-        # reconcile compares the materialized layers.
-        assert all(
-            repo.git(
-                "show-ref", "--verify", f"refs/heads/{branch}", check=False
-            ).returncode
-            == 0
-            for branch in planned_branches
-        )
         return _result(manifest, ["create"])
 
     monkeypatch.setattr(workflow, "reconcile", fake_reconcile)
