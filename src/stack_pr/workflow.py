@@ -9,6 +9,7 @@ from pathlib import Path
 
 from stack_pr.git import (
     Commit,
+    ReplayConflictError,
     StackPrError,
     assign_missing_identities,
     check_source_upstream,
@@ -268,6 +269,37 @@ def _plan_from_merged_block(
     return plan
 
 
+def _reconcile_assuming_unmerged(
+    repo: Path,
+    options: Options,
+    target: str,
+    candidates: list[Commit],
+    manifest: Manifest,
+    *,
+    dry_run: bool,
+) -> tuple[bool, ReconcileResult]:
+    """Replay every layer and reconcile once, as if no layer were merged.
+
+    Returns (True, result), or else (False, plan) to replay without merged
+    layers: a merged layer blocks the call, and a replay conflict may come
+    from one.
+    """
+    try:
+        with materialize_layers(
+            repo,
+            candidates,
+            merged_branches=set(),
+            remote=options.remote,
+            target=target,
+        ):
+            result = reconcile(repo, manifest.assuming_unmerged(), dry_run=dry_run)
+    except ReplayConflictError:
+        return False, reconcile(repo, manifest, dry_run=True)
+    if not result.merged_layer_blocked:
+        return True, result
+    return False, _plan_from_merged_block(repo, manifest, result)
+
+
 def view(
     repo: Path, options: Options, *, progress: Progress | None = None
 ) -> WorkflowResult:
@@ -299,17 +331,11 @@ def view(
     with step(f"Comparing {count} with {options.remote}/{target}"):
         preliminary = planned.preliminary
         if preliminary is None:
-            with materialize_layers(
-                repo,
-                candidates,
-                merged_branches=set(),
-                remote=options.remote,
-                target=target,
-            ):
-                compared = reconcile(repo, manifest.assuming_unmerged(), dry_run=True)
-            if not compared.merged_layer_blocked:
-                return WorkflowResult(manifest, compared)
-            preliminary = _plan_from_merged_block(repo, manifest, compared)
+            done, preliminary = _reconcile_assuming_unmerged(
+                repo, options, target, candidates, manifest, dry_run=True
+            )
+            if done:
+                return WorkflowResult(manifest, preliminary)
         if preliminary.blockers:
             return WorkflowResult(manifest, preliminary)
         _require_merged_patches_unchanged(repo, candidates, preliminary, options.remote)
@@ -371,17 +397,11 @@ def export(
     plan = planned.preliminary
     with step(f"Publishing {count}"):
         if plan is None:
-            with materialize_layers(
-                repo,
-                candidates,
-                merged_branches=set(),
-                remote=options.remote,
-                target=target,
-            ):
-                applied = reconcile(repo, manifest.assuming_unmerged(), dry_run=False)
-            if not applied.merged_layer_blocked:
-                return WorkflowResult(manifest, applied)
-            plan = _plan_from_merged_block(repo, manifest, applied)
+            done, plan = _reconcile_assuming_unmerged(
+                repo, options, target, candidates, manifest, dry_run=False
+            )
+            if done:
+                return WorkflowResult(manifest, plan)
         if plan.blockers:
             raise StackPrError(
                 "native reconciliation is blocked: " + "; ".join(plan.blockers)

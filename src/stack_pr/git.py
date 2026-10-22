@@ -14,6 +14,10 @@ class StackPrError(Exception):
     """A user-actionable stack-pr failure."""
 
 
+class ReplayConflictError(StackPrError):
+    """A layer did not replay cleanly onto the target."""
+
+
 # `merge-tree --write-tree --merge-base` is the replay primitive; it landed in 2.40.
 MINIMUM_GIT_VERSION = (2, 40)
 GIT_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
@@ -697,7 +701,7 @@ def _raise_replay_conflict(
         or result.stderr.strip()
         or "patch did not apply"
     )
-    raise StackPrError(
+    raise ReplayConflictError(
         f"could not replay commit {commit.sha[:12]} onto {target_label}: {detail}"
     )
 

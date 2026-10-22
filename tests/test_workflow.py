@@ -299,6 +299,37 @@ def test_view_compares_exported_stack_in_one_v2_call(
     assert calls == [True]
 
 
+def test_view_plans_first_when_v2_replay_conflicts(
+    repo: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    branch = "octocat/stack/11111111111111111111111111111111"
+    repo.commit_file(
+        "shared.txt", "feature\n", f"Feature\n\nstack-pr-branch: {branch}\n"
+    )
+    repo.git("switch", "master")
+    repo.commit_file("shared.txt", "target\n", "Target\n")
+    repo.git("push", "origin", "master")
+    repo.git("switch", "feature")
+    _mock_identity_and_preflight(monkeypatch, protocol=2)
+    calls: list[tuple[bool, bool]] = []
+
+    def fake_reconcile(
+        path: object, manifest: Manifest, *, dry_run: bool
+    ) -> ReconcileResult:
+        calls.append((manifest.assume_unmerged, dry_run))
+        blocker = {"code": "multiple_stacks", "message": "in two stacks"}
+        return parse_result({"version": 2, "layers": [], "blockers": [blocker]})
+
+    monkeypatch.setattr(workflow, "reconcile", fake_reconcile)
+
+    result = workflow.view(repo.path, Options(None, "HEAD", None, "origin"))
+
+    # The conflicting replay never reaches GitHub; the plan's blockers show.
+    assert calls == [(False, True)]
+    assert result.reconcile_result is not None
+    assert result.reconcile_result.blockers == ["in two stacks"]
+
+
 def test_export_rebuilds_without_layer_merged_under_v2(
     repo: Repo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
