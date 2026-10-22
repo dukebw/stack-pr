@@ -203,6 +203,11 @@ def test_view_lists_blockers_without_a_layer(
         "resolve the blockers before exporting:\n  belongs to multiple stacks\n"
     )
 
+    result.reconcile_result.raw["blockers"].pop(0)
+    result = WorkflowResult(result.manifest, parse_result(result.reconcile_result.raw))
+    _print_result(result, json_output=False, exported=False)
+    assert capsys.readouterr().out.endswith("resolve the blockers before exporting.\n")
+
 
 def test_export_renders_applied_action_and_synced_state(
     capsys: pytest.CaptureFixture[str],

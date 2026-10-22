@@ -186,19 +186,20 @@ def _render_plan(
     if exported or _is_up_to_date(result):
         print(_style("Stack is up to date with local commits.", _GREEN, _BOLD))
     elif result.blockers:
+        # Reasons for desired layers are printed under them above; stack-level
+        # blockers and those of removed or foreign branches belong to none.
+        shown = {layer.blocked_reason for layer in result.layers}
+        unshown = [blocker for blocker in result.blockers if blocker not in shown]
+        ending = ":" if unshown else "."
         print(
             _style(
-                "Stack is not up to date; resolve the blockers before exporting:",
+                f"Stack is not up to date; resolve the blockers before exporting{ending}",
                 _RED,
                 _BOLD,
             )
         )
-        # Reasons for desired layers are printed under them above; stack-level
-        # blockers and those of removed or foreign branches belong to none.
-        shown = {layer.blocked_reason for layer in result.layers}
-        for blocker in result.blockers:
-            if blocker not in shown:
-                print(f"  {_style(blocker, _RED)}")
+        for blocker in unshown:
+            print(f"  {_style(blocker, _RED)}")
     else:
         print(
             _style("Stack is not up to date;", _YELLOW, _BOLD),
